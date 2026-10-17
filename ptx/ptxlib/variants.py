@@ -42,14 +42,23 @@ def supported():
     return sorted(VARIANT_PROBES)
 
 
-def discover_targets(h, seeds=("/",), limit=60, default_param="id", max_params=6):
+# Parameter names a backend commonly reads but its own HTML rarely advertises. When an
+# endpoint exposes no discoverable param, these are swept instead of a single guess:
+# /search?q and /greet?name both inject through params that appear nowhere in the body.
+COMMON_PARAMS = ("id", "q", "query", "search", "name", "user", "url", "file",
+                 "path", "page", "redirect", "next", "target", "cmd", "email", "lang")
+
+
+def discover_targets(h, seeds=("/",), limit=60, default_param="id", max_params=10):
     """Build the (endpoint, param) sweep list by crawling the target.
 
-    For each discovered endpoint, extract the parameters its own body reveals (form
-    fields, query strings); an endpoint that reveals none still gets swept with
-    default_param, because a parameter the page does not advertise can still be one the
-    backend reads. Capped so a large site does not turn one confirmed finding into an
-    unbounded scan.
+    An endpoint that advertises params (form fields, query strings in links) is swept with
+    those. One that advertises none is swept against COMMON_PARAMS rather than a single
+    default, because a backend routinely reads a parameter its own HTML never mentions:
+    /search?q and /greet?name both reflect and inject through params that appear nowhere
+    in the served body, so trusting only advertised params would sweep /search?id and miss
+    the injection entirely. default_param is always included. Capped so a large site does
+    not turn one confirmed finding into an unbounded scan.
     """
     scan = discover.scan(h, start=seeds, limit=limit)
     if scan.get("unmeasured"):
@@ -57,8 +66,9 @@ def discover_targets(h, seeds=("/",), limit=60, default_param="id", max_params=6
     targets, seen = [], set()
     for e in scan.get("results", []):
         path = e["path"]
-        params = discover.extract_params(e.get("body_text", ""))[:max_params] or [default_param]
-        for prm in params:
+        advertised = discover.extract_params(e.get("body_text", ""))
+        params = [default_param] + (advertised if advertised else list(COMMON_PARAMS))
+        for prm in list(dict.fromkeys(params))[:max_params]:
             pair = (path, prm)
             if pair not in seen:
                 seen.add(pair)

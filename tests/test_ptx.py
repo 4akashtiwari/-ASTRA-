@@ -6450,7 +6450,7 @@ class TestVariants(unittest.TestCase):
         with self.assertRaises(ValueError):
             variants.sweep(self._FakeHttp(), "idor", [("/x", "q")])
 
-    def test_discover_targets_falls_back_to_default_param(self):
+    def test_discover_targets_uses_advertised_params_and_a_common_wordlist(self):
         fake_scan = {"unmeasured": False,
                      "results": [{"path": "/a", "body_text": "<form><input name=real></form>"},
                                  {"path": "/b", "body_text": "no params here"}]}
@@ -6462,4 +6462,11 @@ class TestVariants(unittest.TestCase):
         finally:
             discover.scan, discover.extract_params = old_scan, old_ep
         self.assertIn(("/a", "real"), tgts)  # advertised param used
-        self.assertIn(("/b", "id"), tgts)    # default param when none advertised
+        self.assertIn(("/b", "id"), tgts)    # default param always included
+        # An endpoint that advertises nothing is swept against the common wordlist, not a
+        # single guess -- this is what finds /search?q and /greet?name on a real crawl.
+        self.assertIn(("/b", "q"), tgts)
+        self.assertIn(("/b", "name"), tgts)
+        # An endpoint that DOES advertise a param is not shotganned with the whole wordlist,
+        # which would multiply requests without adding signal.
+        self.assertNotIn(("/a", "q"), tgts)
