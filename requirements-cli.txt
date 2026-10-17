@@ -1,0 +1,16 @@
+# ptx CLI — the CORE is stdlib-only. Exactly one OPTIONAL enhancement exists.
+#
+# CORE (every probe except probe_constraint_logic): NO third-party dependencies.
+# Verified on Python 3.13.14: ptx/ptx.py and every module under ptx/ptxlib/ import only
+# argparse, base64, concurrent, hashlib, hmac, http, ipaddress, json, os, re, socket, ssl,
+# subprocess, time, urllib.
+#
+# OPTIONAL (opt-in; the tool degrades gracefully when it is absent):
+#   z3-solver — used ONLY by probe_constraint_logic, which uses an SMT solver to search for an
+#               input that violates a stated business-logic invariant. The import is guarded by
+#               try/except: without z3 that one probe returns inconclusive ("z3 not installed")
+#               and every other probe is completely unaffected.
+#               Install with:  pip install z3-solver
+#
+# This file exists so "what does the tool need?" has an unambiguous answer that survives
+# someone adding a dependency later without noticing they changed the tool's footprint.

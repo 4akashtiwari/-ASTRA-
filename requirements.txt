@@ -1,0 +1,32 @@
+# ptx — dependency manifest
+#
+# The CLI and every module in ptx/ptxlib/ are PURE STDLIB. Nothing here is needed to run
+# `ptx` itself, to run the test suite's non-target tests, or to produce a report.
+#
+# These pins exist because the sandbox lost flask twice mid-session and the benchmark
+# silently stopped being runnable. A tool whose harness depends on an unpinned environment
+# is a tool that stops working without telling you why.
+
+# --- benchmark and hardened targets (bench/target_v2.py, tests/safe_target.py,
+#     tests/property_targets.py) ---
+Flask==3.1.3
+Werkzeug==3.1.8
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+itsdangerous==2.2.0
+click==8.4.2
+blinker==1.9.0
+
+# --- SMT solver: probe_constraint_logic solves for business-logic invariant violations.
+#     OPTIONAL for the CLI (the probe degrades to inconclusive without it) but REQUIRED for
+#     the benchmark, whose V30/N12 targets exercise it. ---
+z3-solver==5.1.0
+
+# --- measurement (optional; `ptx` does not use it) ---
+coverage==7.16.0
+
+# Python: 3.13.14 used during development. 3.9+ should work — the code uses only
+# dict-ordering guarantees (3.7+), f-strings, and dataclass-free plain dicts.
+# Static analysis: TestStaticLintGate fails the suite on any undefined name.
+# Bug #17 (a NameError in ptx recon) was found by pyflakes, not by reading.
+pyflakes==3.4.0

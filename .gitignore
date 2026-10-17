@@ -1,0 +1,30 @@
+# ============================================================================
+# NEVER PUBLISH — real subject data and the means to reverse redaction.
+# The whole point of the LLM-boundary redactor is that the subject's identity
+# stays on the operator's machine. These paths hold that identity in the clear.
+# ============================================================================
+engagements/
+**/redaction-map.json
+uploads/
+dryrun/
+
+# Bench run artifacts (regenerated on every run; may contain target output).
+bench/engagement/
+
+# --- Python / tooling -------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.cache/
+.config/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / sandbox cruft -----------------------------------------------------
+.DS_Store
+*.swp
+.sudo_as_admin_successful

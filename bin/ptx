@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""ptx launcher — puts the CLI on PATH without packaging it.
+
+Usage:  ln -s <install>/bin/ptx ~/.local/bin/ptx     (or add bin/ to PATH)
+
+The install directory is resolved from this file's real path, so a symlink works and the
+CLI can be invoked from any working directory.
+
+Two naming details worth knowing: `bin/` sits beside the `ptx/` package directory, and
+`ptx.py` lives inside a directory also called `ptx`, so a plain `import ptx` binds to the
+directory rather than the module. The CLI is therefore loaded by explicit file path.
+"""
+import importlib.util
+import os
+import sys
+
+INSTALL = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CLI_ROOT = os.path.join(INSTALL, "ptx")
+CLI_MAIN = os.path.join(CLI_ROOT, "ptx.py")
+
+if not os.path.exists(CLI_MAIN):
+    sys.stderr.write(f"ptx: cannot find {CLI_MAIN}\n")
+    sys.exit(1)
+
+sys.path.insert(0, CLI_ROOT)      # so `import ptxlib...` resolves
+
+_spec = importlib.util.spec_from_file_location("ptx_cli", CLI_MAIN)
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["ptx_cli"] = _mod
+_spec.loader.exec_module(_mod)
+
+if __name__ == "__main__":
+    sys.exit(_mod.main())
