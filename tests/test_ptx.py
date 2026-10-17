@@ -527,6 +527,24 @@ class TestFindings(TmpEngagement):
         base.update(kw)
         return base
 
+    def test_finding_records_its_location(self):
+        rec, _ = fnd.from_probe(self.dir, self._verdict(endpoint="/search", param="q"))
+        self.assertEqual(rec["endpoint"], "/search")
+        self.assertEqual(rec["param"], "q")
+
+    def test_location_is_none_when_the_probe_named_none(self):
+        # A parameterless probe (exposure, headers) has no endpoint/param; the fields are
+        # present but None rather than absent, so downstream readers need no special case.
+        rec, _ = fnd.from_probe(self.dir, self._verdict())
+        self.assertIsNone(rec["endpoint"])
+        self.assertIsNone(rec["param"])
+
+    def test_get_returns_a_finding_by_id_and_none_when_absent(self):
+        rec, _ = fnd.from_probe(self.dir, self._verdict(endpoint="/x", param="y"))
+        got = fnd.get(self.dir, rec["id"])
+        self.assertEqual(got["endpoint"], "/x")
+        self.assertIsNone(fnd.get(self.dir, "PTX-999"))
+
     def test_unconfirmed_probe_creates_no_finding(self):
         rec, created = fnd.from_probe(self.dir, self._verdict(vulnerable=False))
         self.assertIsNone(rec)

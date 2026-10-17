@@ -142,6 +142,7 @@ ptx fingerprint --base <url> [--path <p>] [--cve]
     # A CVE is a LEAD; reachability is separate (`ptx cve reach`). Implements the ORACLE agent.
 
 ptx variants --class <c> --base <url> [--seed-path <p> --seed-param <q>] [--target <path:param>]... [--discover]
+ptx variants --from-finding PTX-003 --base <url> [--discover]
     # Variant analysis: from ONE confirmed fault, sweep the same probe class across sibling
     # endpoints. Vulnerabilities cluster -- a flaw copy-pasted across endpoints is several bugs,
     # not one. Give it the confirmed class (sqli/xss/cmdi/ssrf/traversal/redirect) and either list
@@ -149,6 +150,8 @@ ptx variants --class <c> --base <url> [--seed-path <p> --seed-param <q>] [--targ
     # first confirmed) is re-confirmed and reported separately from NEW variants; every new variant
     # is recorded as its own finding. "Seed only, siblings clean" is a real result -- it bounds the
     # issue. Only injectable classes can be swept; business-logic classes have no sibling to sweep.
+    # --from-finding starts from a recorded finding: it takes the class and the confirmed location
+    # as the seed, so the sweep needs nothing retyped (findings now record where they were found).
 
 ptx finding list | validate | set <ID> --impact "..." --severity High --artifact <ref>
 ptx report                      # BLOCKS if any finding is invalid

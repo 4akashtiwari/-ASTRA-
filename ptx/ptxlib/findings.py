@@ -72,6 +72,11 @@ def from_probe(engagement, probe_result, artifacts=None, impact=None, repro=None
         "id": fid,
         "title": probe_result["name"],
         "class": probe_result["id"],
+        # Where the fault was confirmed, so a later variant sweep (`--from-finding`) or a
+        # retest can find the location without re-deriving it from prose. Absent on
+        # findings recorded before this field existed, and on parameterless probes.
+        "endpoint": probe_result.get("endpoint"),
+        "param": probe_result.get("param"),
         "severity": probe_result.get("severity") or "Medium",
         "status": "confirmed",
         "summary": probe_result.get("mechanism", ""),
@@ -110,6 +115,15 @@ def all_findings(engagement):
             with open(os.path.join(_dir(engagement), fn)) as f:
                 out.append(json.load(f))
     return out
+
+
+def get(engagement, fid):
+    """One finding by id (e.g. 'PTX-003'), or None if it does not exist. The file is the id."""
+    p = os.path.join(_dir(engagement), f"{fid}.json")
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
 
 
 def validate(rec):

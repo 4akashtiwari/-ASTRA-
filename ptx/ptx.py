@@ -545,6 +545,11 @@ def cmd_probe(args):
     def run(v):
         before, _failed_before[0] = _failed_before[0], h.transport_failures
         probes.mark_unmeasured(v, h, before)
+        # Location-awareness: stamp WHERE this verdict was produced so a later variant
+        # sweep (`--from-finding`) or retest can find it. Probes take their target from
+        # the command args; setdefault so a probe that already named its own location wins.
+        v.setdefault("endpoint", getattr(args, "path", None))
+        v.setdefault("param", getattr(args, "param", None))
         s, rec = _record(args, v)
         out.append({"verdict": v, "suspicion": s["id"],
                     "finding": rec["id"] if rec else None})
@@ -1240,6 +1245,22 @@ def cmd_variants(args):
     h, rps = _client(args, sc)
     print(f"  scope: {reason} | rate ceiling {rps} req/s")
     klass = args.klass
+    seed = (args.seed_path, args.seed_param) if args.seed_path else None
+    if args.from_finding:
+        rec = fnd.get(args.engagement, args.from_finding)
+        if not rec:
+            print(f"  no such finding: {args.from_finding}")
+            return EXIT_USAGE
+        # The finding carries the class and (if it was recorded location-aware) where it
+        # was confirmed -- so the sweep can start from a finding ID with nothing retyped.
+        klass = klass or rec.get("class")
+        if rec.get("endpoint") and not seed:
+            seed = (rec["endpoint"], rec.get("param") or "q")
+        loc = f"{seed[0]}?{seed[1]}" if seed else "no recorded location"
+        print(f"  from finding {args.from_finding}: class={klass}, seed={loc}")
+    if not klass:
+        print("  no class to sweep: pass --class or --from-finding <PTX-ID>")
+        return EXIT_USAGE
     if klass not in variants.supported():
         print(f"  class {klass!r} cannot be swept; supported: {', '.join(variants.supported())}")
         return EXIT_USAGE
@@ -1248,7 +1269,6 @@ def cmd_variants(args):
     for t in (args.target or []):
         p, q = t.split(":", 1) if ":" in t else (t, args.default_param)
         targets.append((p, q))
-    seed = (args.seed_path, args.seed_param) if args.seed_path else None
     if seed and seed not in targets:
         targets.append(seed)
     if args.discover:
@@ -1273,6 +1293,7 @@ def cmd_variants(args):
         statemod.log_action(args.engagement, "5-assessment", f"probe {klass} (variant sweep)",
                             ep, outcome, probe=klass, endpoint=ep, verdict=outcome)
         if v.get("vulnerable") and not (seed and (t["path"], t["param"]) == seed):
+            v["endpoint"], v["param"] = t["path"], t["param"]  # so --from-finding finds it
             _record(args, v)
 
     lines = [f"  class `{klass}` swept across {rep['tested']} endpoint/param pair(s)"
@@ -1393,8 +1414,11 @@ def build_parser():
     fp.set_defaults(fn=cmd_fingerprint)
 
     va = sub.add_parser("variants", help="from one confirmed fault, sweep the same class across sibling endpoints")
-    va.add_argument("--class", dest="klass", required=True, choices=variants.supported(),
-                    help="the confirmed finding's class (only injectable classes can be swept)")
+    va.add_argument("--class", dest="klass", choices=variants.supported(),
+                    help="the confirmed finding's class (only injectable classes can be swept); "
+                         "optional with --from-finding, which supplies it")
+    va.add_argument("--from-finding", metavar="PTX-ID",
+                    help="start from a recorded finding: takes its class and confirmed location as the seed")
     va.add_argument("--base", required=True)
     va.add_argument("--target", action="append",
                     help="sibling endpoint to sweep, as PATH:PARAM (repeatable)")
