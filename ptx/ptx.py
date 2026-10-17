@@ -18,7 +18,7 @@ from ptxlib.scope import ScopeViolation, load_scope
 from ptxlib import (cve, osint, state as statemod, probes, findings as fnd,
                     report as rpt, reachability, chains, reliability, integrity,
                     recon, chainwalk, coverage, takeover, discover, identities, redact,
-                    fingerprint)
+                    fingerprint, variants)
 
 EXIT_OK, EXIT_NORESULT, EXIT_SCOPE, EXIT_NOTOOL, EXIT_UNREACHABLE = 0, 2, 3, 4, 5
 # A malformed invocation is not a scope violation and not a missing tool. It gets
@@ -1228,6 +1228,64 @@ def cmd_fingerprint(args):
     return EXIT_OK
 
 
+def cmd_variants(args):
+    """From one confirmed fault, sweep the same probe class across sibling endpoints.
+
+    The seed is where the class was already confirmed; the sweep answers the question a
+    single finding leaves open -- which OTHER endpoints share the fault. Each new variant
+    is recorded as its own finding, because a copy-pasted flaw in five endpoints is five
+    bugs to fix, not one.
+    """
+    sc, reason = _require_in_scope(args)
+    h, rps = _client(args, sc)
+    print(f"  scope: {reason} | rate ceiling {rps} req/s")
+    klass = args.klass
+    if klass not in variants.supported():
+        print(f"  class {klass!r} cannot be swept; supported: {', '.join(variants.supported())}")
+        return EXIT_USAGE
+
+    targets = []
+    for t in (args.target or []):
+        p, q = t.split(":", 1) if ":" in t else (t, args.default_param)
+        targets.append((p, q))
+    seed = (args.seed_path, args.seed_param) if args.seed_path else None
+    if seed and seed not in targets:
+        targets.append(seed)
+    if args.discover:
+        targets += variants.discover_targets(h, default_param=args.default_param)
+    targets = list(dict.fromkeys(targets))  # de-dup, preserve order
+    if not targets:
+        print("  nothing to sweep: pass --target PATH:PARAM (repeatable), --seed-path, or --discover")
+        return EXIT_USAGE
+
+    rep = variants.analyze(h, klass, targets, seed=seed)
+
+    # Record each NEW variant as a finding; the seed is already a finding from when it
+    # was first confirmed, so re-recording it would duplicate the ledger entry.
+    for t in rep["results"]:
+        v = t["verdict"]
+        if v.get("vulnerable") and not (seed and (t["path"], t["param"]) == seed):
+            _record(args, v)
+
+    lines = [f"  class `{klass}` swept across {rep['tested']} endpoint/param pair(s)"
+             + (f"; seed {seed[0]}?{seed[1]}" if seed else "")]
+    if seed:
+        lines.append(f"  seed: {'RE-CONFIRMED' if rep['seed_confirmed'] else 'NOT reproduced on re-run'}")
+    lines.append(f"  NEW variants: {len(rep['new_variants'])}   "
+                 f"clean siblings: {len(rep['clean'])}   errored: {len(rep['errored'])}")
+    for nv in rep["new_variants"]:
+        lines.append(f"    [VULN] {nv['path']}?{nv['param']}  -- {nv['evidence'][:90]}")
+    if not rep["new_variants"]:
+        lines.append("    no additional endpoint shares this fault -- the issue is bounded to the seed")
+    for er in rep["errored"]:
+        lines.append(f"    [error] {er['path']}?{er['param']}  -- {er['evidence'][:80]}")
+    emit(args, lines, {"class": klass, "seed": rep["seed"],
+                       "seed_confirmed": rep["seed_confirmed"], "tested": rep["tested"],
+                       "new_variants": rep["new_variants"], "clean": rep["clean"],
+                       "errored": rep["errored"]})
+    return EXIT_OK
+
+
 def _redactor_path(args):
     return os.path.join(args.engagement, "redaction-map.json")
 
@@ -1325,6 +1383,21 @@ def build_parser():
     fp.add_argument("--cve", action="store_true", help="correlate detected versions with OSV.dev (live)")
     fp.add_argument("--rate", type=int, default=0); fp.add_argument("--timeout", type=int, default=15)
     fp.set_defaults(fn=cmd_fingerprint)
+
+    va = sub.add_parser("variants", help="from one confirmed fault, sweep the same class across sibling endpoints")
+    va.add_argument("--class", dest="klass", required=True, choices=variants.supported(),
+                    help="the confirmed finding's class (only injectable classes can be swept)")
+    va.add_argument("--base", required=True)
+    va.add_argument("--target", action="append",
+                    help="sibling endpoint to sweep, as PATH:PARAM (repeatable)")
+    va.add_argument("--seed-path", help="endpoint where the class was already confirmed")
+    va.add_argument("--seed-param", default="q", help="param of the confirmed seed (default q)")
+    va.add_argument("--discover", action="store_true",
+                    help="auto-crawl the target for endpoints+params instead of listing them")
+    va.add_argument("--default-param", default="id",
+                    help="param to sweep on endpoints that advertise none (default id)")
+    va.add_argument("--rate", type=int, default=0); va.add_argument("--timeout", type=int, default=15)
+    va.set_defaults(fn=cmd_variants)
 
     rd = sub.add_parser("redact", help="replace subject identifiers with stable placeholders before text crosses the LLM boundary")
     rd.add_argument("file", nargs="?", help="file to redact (default: stdin)")

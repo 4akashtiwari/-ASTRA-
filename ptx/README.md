@@ -141,6 +141,15 @@ ptx fingerprint --base <url> [--path <p>] [--cve]
     # OSV ecosystem (nginx, PHP, WordPress) are surfaced as "check vendor advisories", not "clean".
     # A CVE is a LEAD; reachability is separate (`ptx cve reach`). Implements the ORACLE agent.
 
+ptx variants --class <c> --base <url> [--seed-path <p> --seed-param <q>] [--target <path:param>]... [--discover]
+    # Variant analysis: from ONE confirmed fault, sweep the same probe class across sibling
+    # endpoints. Vulnerabilities cluster -- a flaw copy-pasted across endpoints is several bugs,
+    # not one. Give it the confirmed class (sqli/xss/cmdi/ssrf/traversal/redirect) and either list
+    # siblings with --target PATH:PARAM or let --discover crawl for them. The seed (where it was
+    # first confirmed) is re-confirmed and reported separately from NEW variants; every new variant
+    # is recorded as its own finding. "Seed only, siblings clean" is a real result -- it bounds the
+    # issue. Only injectable classes can be swept; business-logic classes have no sibling to sweep.
+
 ptx finding list | validate | set <ID> --impact "..." --severity High --artifact <ref>
 ptx report                      # BLOCKS if any finding is invalid
 

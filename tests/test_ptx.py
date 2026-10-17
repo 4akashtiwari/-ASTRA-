@@ -20,7 +20,7 @@ sys.path.insert(0, ROOT)
 
 from ptxlib import scope as scopelib, cve, osint, probes, findings as fnd, report as rpt, \
     chains, reliability, integrity, recon, chainwalk, coverage, \
-    reachability, state as statemod, takeover, discover, identities
+    reachability, state as statemod, takeover, discover, identities, variants
 
 VULN_PORT, SAFE_PORT = 5101, 5102
 VULN = f"http://127.0.0.1:{VULN_PORT}"
@@ -6368,3 +6368,98 @@ class TestFingerprint(unittest.TestCase):
         out = self.fp.enrich(comps, query_fn=fake)
         self.assertEqual(out[0]["advisories"]["total"], 2)
         self.assertEqual(out[0]["cves"], ["CVE-2020-11022", "CVE-2020-11023"])
+
+
+class TestVariants(unittest.TestCase):
+    """Variant analysis: from one confirmed fault, sweep the same class across siblings.
+
+    The probes themselves are exercised elsewhere; these tests inject fake probe
+    callables so the SWEEP and PARTITION logic is tested deterministically and offline.
+    """
+
+    class _FakeHttp:
+        base = "http://t"
+        def req(self, *a, **k):
+            return {"code": 200, "body": "", "headers": {}, "error": None}
+
+    def _verdict(self, vuln, inconclusive=False):
+        return {"id": "sqli", "name": "sqli", "vulnerable": vuln,
+                "inconclusive": inconclusive, "evidence": "ev", "mechanism": "m",
+                "teaching": "t", "severity": "High"}
+
+    def test_supported_is_only_the_injectable_classes(self):
+        s = variants.supported()
+        for c in ("sqli", "xss", "cmdi", "ssrf", "traversal", "redirect"):
+            self.assertIn(c, s)
+        # Business-logic / stateful classes have no comparable sibling endpoint to sweep;
+        # pretending otherwise would produce noise, so they are deliberately absent.
+        for c in ("idor", "double-spend", "race-consume", "jwt-none"):
+            self.assertNotIn(c, s)
+
+    def test_sweep_partitions_vulnerable_clean_and_errored(self):
+        calls = []
+        def fake(h, path, param):
+            calls.append((path, param))
+            if path == "/boom":
+                raise RuntimeError("endpoint exploded")
+            return self._verdict(path == "/vuln")
+        old = variants.VARIANT_PROBES["sqli"]
+        variants.VARIANT_PROBES["sqli"] = fake
+        try:
+            res = variants.sweep(self._FakeHttp(), "sqli",
+                                 [("/vuln", "q"), ("/clean", "q"), ("/boom", "q")])
+        finally:
+            variants.VARIANT_PROBES["sqli"] = old
+        self.assertEqual(len(res), 3)
+        self.assertEqual(len(calls), 3)  # a raising sibling did NOT abort the sweep
+        byp = {r["path"]: r["verdict"] for r in res}
+        self.assertTrue(byp["/vuln"]["vulnerable"])
+        self.assertFalse(byp["/clean"]["vulnerable"])
+        self.assertTrue(byp["/boom"]["inconclusive"])  # error caught, recorded, not raised
+
+    def test_analyze_separates_seed_from_new_variants(self):
+        def fake(h, path, param):
+            return self._verdict(path in ("/seed", "/sibling"))  # seed + one sibling vuln
+        old = variants.VARIANT_PROBES["sqli"]
+        variants.VARIANT_PROBES["sqli"] = fake
+        try:
+            rep = variants.analyze(self._FakeHttp(), "sqli",
+                                   [("/seed", "q"), ("/sibling", "q"), ("/clean", "q")],
+                                   seed=("/seed", "q"))
+        finally:
+            variants.VARIANT_PROBES["sqli"] = old
+        self.assertTrue(rep["seed_confirmed"])
+        self.assertEqual(rep["vulnerable_total"], 2)  # seed + sibling both vulnerable
+        self.assertEqual([v["path"] for v in rep["new_variants"]], ["/sibling"])  # seed excluded
+        self.assertEqual([c["path"] for c in rep["clean"]], ["/clean"])
+        self.assertEqual(rep["tested"], 3)
+
+    def test_analyze_without_seed_counts_every_hit_as_a_variant(self):
+        def fake(h, path, param):
+            return self._verdict(path == "/hit")
+        old = variants.VARIANT_PROBES["xss"]
+        variants.VARIANT_PROBES["xss"] = fake
+        try:
+            rep = variants.analyze(self._FakeHttp(), "xss", [("/hit", "q"), ("/miss", "q")])
+        finally:
+            variants.VARIANT_PROBES["xss"] = old
+        self.assertIsNone(rep["seed"])
+        self.assertEqual([v["path"] for v in rep["new_variants"]], ["/hit"])
+
+    def test_sweep_refuses_a_class_it_cannot_sweep(self):
+        with self.assertRaises(ValueError):
+            variants.sweep(self._FakeHttp(), "idor", [("/x", "q")])
+
+    def test_discover_targets_falls_back_to_default_param(self):
+        fake_scan = {"unmeasured": False,
+                     "results": [{"path": "/a", "body_text": "<form><input name=real></form>"},
+                                 {"path": "/b", "body_text": "no params here"}]}
+        old_scan, old_ep = discover.scan, discover.extract_params
+        discover.scan = lambda h, **k: fake_scan
+        discover.extract_params = lambda body: (["real"] if "real" in body else [])
+        try:
+            tgts = variants.discover_targets(self._FakeHttp(), default_param="id")
+        finally:
+            discover.scan, discover.extract_params = old_scan, old_ep
+        self.assertIn(("/a", "real"), tgts)  # advertised param used
+        self.assertIn(("/b", "id"), tgts)    # default param when none advertised
