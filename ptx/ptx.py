@@ -1260,10 +1260,18 @@ def cmd_variants(args):
 
     rep = variants.analyze(h, klass, targets, seed=seed)
 
-    # Record each NEW variant as a finding; the seed is already a finding from when it
-    # was first confirmed, so re-recording it would duplicate the ledger entry.
+    # Log every swept (class, endpoint) pair to the action log so `ptx coverage` counts the
+    # sweep, and record each NEW variant as a finding. The seed is already a finding from
+    # when it was first confirmed, so re-recording it would duplicate the ledger entry.
+    # Each result is logged against ITS OWN endpoint -- _log_probe keys off args.path, which
+    # is meaningless here because a sweep spans many endpoints, not the one on the command.
     for t in rep["results"]:
         v = t["verdict"]
+        ep = f"{t['path']}?{t['param']}"
+        outcome = ("vulnerable" if v.get("vulnerable")
+                   else "inconclusive" if v.get("inconclusive") else "negative")
+        statemod.log_action(args.engagement, "5-assessment", f"probe {klass} (variant sweep)",
+                            ep, outcome, probe=klass, endpoint=ep, verdict=outcome)
         if v.get("vulnerable") and not (seed and (t["path"], t["param"]) == seed):
             _record(args, v)
 
