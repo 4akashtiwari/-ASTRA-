@@ -153,6 +153,13 @@ ptx variants --from-finding PTX-003 --base <url> [--discover]
     # --from-finding starts from a recorded finding: it takes the class and the confirmed location
     # as the seed, so the sweep needs nothing retyped (findings now record where they were found).
 
+ptx retest --base <url> [--finding PTX-003]
+    # Phase 8: re-run each confirmed finding's OWN probe at its recorded location after a claimed
+    # fix. Reports not-reproduced / STILL OPEN / inconclusive / manual (a class that cannot be
+    # re-run from a stored location). 'Not-reproduced' is deliberately NOT 'fixed' -- a black-box
+    # re-run cannot tell a real fix from a WAF rule or a rate limit, so the operator confirms the
+    # root cause against the diff before closing it.
+
 ptx finding list | validate | set <ID> --impact "..." --severity High --artifact <ref>
 ptx report                      # BLOCKS if any finding is invalid
 

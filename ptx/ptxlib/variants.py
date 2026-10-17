@@ -134,3 +134,47 @@ def analyze(h, klass, targets, seed=None):
                      "evidence": (t["verdict"].get("evidence") or "")[:200]} for t in errored],
         "results": results,
     }
+
+
+# --- Retest: re-run a confirmed finding's own probe after a claimed fix -----------------
+#
+# Roadmap phase 8. A finding that recorded WHERE it was confirmed can be re-run without
+# anyone remembering the original payload. The classification is deliberately cautious:
+# a probe that no longer fires is "not-reproduced", NOT "fixed" -- a WAF rule, a rate
+# limit, or a transient error can silence an exploit while the root cause survives. The
+# word "fixed" belongs to the operator who reads the diff, not to a black-box re-run.
+
+def retest_probe(klass):
+    """The callable that re-runs `klass` from a stored location, or None if it cannot be
+    re-run from (endpoint, param) alone. Injectable families take (h, path, param);
+    jwt-none takes (h, path). Everything else needs a second identity, a cookie, or a
+    body that a finding does not store, so it is flagged for manual retest, not guessed."""
+    if klass in VARIANT_PROBES:
+        return VARIANT_PROBES[klass]
+    if klass == "jwt-none":
+        return lambda h, p, q: probes.probe_jwt_none(h, p)
+    return None
+
+
+def retest_finding(h, rec):
+    """Re-run one finding's probe at its recorded location.
+
+    Returns a dict with `status` in {not-reproduced, open, inconclusive, manual} and the
+    evidence or reason. Never raises: a probe that errors is 'inconclusive', because an
+    error is not a fix and must not be reported as one.
+    """
+    klass = rec.get("class")
+    ep, prm = rec.get("endpoint"), rec.get("param")
+    fn = retest_probe(klass)
+    if not fn or not ep:
+        return {"status": "manual",
+                "reason": "this class or finding has no re-runnable location "
+                          "(needs parameters the finding does not store)"}
+    try:
+        v = fn(h, ep, prm or "q")
+    except Exception as e:  # noqa: BLE001 - an error is inconclusive, never "fixed"
+        return {"status": "inconclusive", "reason": f"probe raised: {e}"}
+    if v.get("inconclusive"):
+        return {"status": "inconclusive", "reason": (v.get("evidence") or "")[:160]}
+    return {"status": "open" if v.get("vulnerable") else "not-reproduced",
+            "evidence": (v.get("evidence") or "")[:160]}

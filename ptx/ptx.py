@@ -1315,6 +1315,56 @@ def cmd_variants(args):
     return EXIT_OK
 
 
+def cmd_retest(args):
+    """Re-run confirmed findings' own probes after a claimed fix (roadmap phase 8).
+
+    Reports not-reproduced / still-open / inconclusive / manual per finding. A finding that
+    no longer reproduces is NOT auto-marked fixed: a black-box re-run cannot distinguish a
+    real fix from a WAF rule or a rate limit, so the operator confirms against the diff.
+    """
+    sc, reason = _require_in_scope(args)
+    h, rps = _client(args, sc)
+    print(f"  scope: {reason} | rate ceiling {rps} req/s")
+    if args.finding:
+        rec = fnd.get(args.engagement, args.finding)
+        if not rec:
+            print(f"  no such finding: {args.finding}")
+            return EXIT_USAGE
+        recs = [rec]
+    else:
+        recs = [r for r in fnd.all_findings(args.engagement) if r.get("status") == "confirmed"]
+    if not recs:
+        print("  no confirmed findings to retest")
+        return EXIT_NORESULT
+
+    counts = {"not-reproduced": 0, "open": 0, "inconclusive": 0, "manual": 0}
+    lines, results = [], []
+    for rec in recs:
+        res = variants.retest_finding(h, rec)
+        counts[res["status"]] += 1
+        ep = rec.get("endpoint") or "(no location)"
+        prm = rec.get("param")
+        where = f"{ep}?{prm}" if prm else ep
+        detail = res.get("evidence") or res.get("reason") or ""
+        lines.append(f"  [{res['status'].upper():14s}] {rec['id']} {rec.get('class')} @ {where}"
+                     f"  {detail[:70]}")
+        statemod.log_action(args.engagement, "8-retest", f"retest {rec.get('class')}", where,
+                            res["status"], probe=rec.get("class"), endpoint=where,
+                            verdict=res["status"])
+        results.append({"id": rec["id"], "class": rec.get("class"),
+                        "endpoint": rec.get("endpoint"), "param": rec.get("param"),
+                        "status": res["status"]})
+    summary = [f"  retested {len(recs)} finding(s): {counts['not-reproduced']} not-reproduced, "
+               f"{counts['open']} STILL OPEN, {counts['inconclusive']} inconclusive, "
+               f"{counts['manual']} manual"]
+    if counts["not-reproduced"]:
+        summary.append("  NOTE: 'not-reproduced' means the exploit no longer works from here -- "
+                       "confirm the root cause is fixed, not just filtered, before closing it.")
+    emit(args, summary + lines,
+         {"retested": len(recs), "counts": counts, "results": results})
+    return EXIT_OK
+
+
 def _redactor_path(args):
     return os.path.join(args.engagement, "redaction-map.json")
 
@@ -1430,6 +1480,12 @@ def build_parser():
                     help="param to sweep on endpoints that advertise none (default id)")
     va.add_argument("--rate", type=int, default=0); va.add_argument("--timeout", type=int, default=15)
     va.set_defaults(fn=cmd_variants)
+
+    rt = sub.add_parser("retest", help="re-run confirmed findings after a fix; reports not-reproduced / still-open")
+    rt.add_argument("--base", required=True)
+    rt.add_argument("--finding", metavar="PTX-ID", help="retest one finding (default: all confirmed)")
+    rt.add_argument("--rate", type=int, default=0); rt.add_argument("--timeout", type=int, default=15)
+    rt.set_defaults(fn=cmd_retest)
 
     rd = sub.add_parser("redact", help="replace subject identifiers with stable placeholders before text crosses the LLM boundary")
     rd.add_argument("file", nargs="?", help="file to redact (default: stdin)")

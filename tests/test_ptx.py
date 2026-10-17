@@ -6488,3 +6488,40 @@ class TestVariants(unittest.TestCase):
         # An endpoint that DOES advertise a param is not shotganned with the whole wordlist,
         # which would multiply requests without adding signal.
         self.assertNotIn(("/a", "q"), tgts)
+
+    def test_retest_classifies_open_and_not_reproduced(self):
+        def fake(h, path, param):
+            return self._verdict(path == "/v")
+        old = variants.VARIANT_PROBES["sqli"]
+        variants.VARIANT_PROBES["sqli"] = fake
+        try:
+            self.assertEqual(variants.retest_finding(
+                self._FakeHttp(), {"class": "sqli", "endpoint": "/v", "param": "q"})["status"], "open")
+            self.assertEqual(variants.retest_finding(
+                self._FakeHttp(), {"class": "sqli", "endpoint": "/c", "param": "q"})["status"], "not-reproduced")
+        finally:
+            variants.VARIANT_PROBES["sqli"] = old
+
+    def test_retest_is_manual_without_a_location_or_a_rerunnable_class(self):
+        h = self._FakeHttp()
+        self.assertEqual(variants.retest_finding(h, {"class": "sqli"})["status"], "manual")
+        self.assertEqual(variants.retest_finding(
+            h, {"class": "idor", "endpoint": "/x", "param": "id"})["status"], "manual")
+
+    def test_retest_is_inconclusive_when_the_probe_raises(self):
+        def boom(h, path, param):
+            raise RuntimeError("target down")
+        old = variants.VARIANT_PROBES["xss"]
+        variants.VARIANT_PROBES["xss"] = boom
+        try:
+            res = variants.retest_finding(
+                self._FakeHttp(), {"class": "xss", "endpoint": "/g", "param": "name"})
+        finally:
+            variants.VARIANT_PROBES["xss"] = old
+        self.assertEqual(res["status"], "inconclusive")  # an error is NOT a fix
+
+    def test_retest_probe_knows_which_classes_it_can_rerun(self):
+        self.assertIsNotNone(variants.retest_probe("sqli"))
+        self.assertIsNotNone(variants.retest_probe("jwt-none"))   # takes (h, path)
+        self.assertIsNone(variants.retest_probe("idor"))          # needs a second identity
+        self.assertIsNone(variants.retest_probe("double-spend"))  # stateful, no location
