@@ -16,7 +16,7 @@ application penetration testing. OSINT-first, CLI-native, evidence-driven, team-
 | `pentest-agent-builder.md` | Meta-prompt: instructions for a *coding* agent to build this as a real CLI (`ptx`). |
 | **`../bench/BENCHMARK.md`** | The working benchmark harness — what was measured, what it scored, what it can't tell you. |
 | **`../ptx/README.md`** | The working CLI — scope guard, live CVE lookup, OSINT, probes, findings, report generator, Suspicion Ledger, selfcheck gate. |
-| **`../tests/test_ptx.py`** | 442 tests. Runs every probe against a vulnerable target *and* a hardened twin, so false positives are detectable. |
+| **`../tests/test_ptx.py`** | 506 tests. Runs probes against a vulnerable target *and* a hardened twin, so regressions and false positives in the fixtures are detectable. |
 
 Each prompt is self-contained between its `START` / `END` markers — copy only that region.
 
@@ -197,21 +197,21 @@ Being explicit, because the useful part of this pack is knowing its own edges:
 
 | Gap | Why it matters |
 |---|---|
-| **OSINT against a real domain** | The highest-signal phase. `127.0.0.1` has no public footprint, so it's never been exercised |
-| **Live CVE lookup** | The planted lockfile never hit OSV.dev or NVD. The anti-hallucination rule is untested |
-| **Business logic depth** | One race condition. This is the category AI is documented as worst at, and it's under-represented |
+| **Full passive OSINT against a public domain** | DNS/email-auth collection has worked against a real domain, but crt.sh and Wayback have not returned usable data from this sandbox; this leaves subdomain and historical-URL coverage unvalidated |
+| **Live CVE lookup assurance** | OSV.dev lookup has been exercised against real CVE identifiers, but that does not establish coverage or precision for arbitrary lockfiles, nor prove an agent will obey the no-memory rule |
+| **Business logic generalization** | The harness now covers pricing, refunds, workflow gates, double-spend and races, but only in one self-authored application; real-world business invariants remain underrepresented |
 | **Echo's whole test matrix** | No AI components in the target |
 | **The benchmark's circularity** | I built both the target and the oracles. It tests whether techniques work, not whether an agent would think to run them |
-| **`ptx` is partial** | Scope guard, CVE lookup, OSINT, Suspicion Ledger and selfcheck are built and verified. `recon`, `surface`, `probe`, `finding` and `report` are still spec-only |
-| **CVE reachability** | The audit correctly reports reachability as UNASSESSED, but nothing closes that gap. This is the highest-value missing piece |
+| **No end-to-end agent runtime** | The CLI implements `recon`, `discover`, `probe`, `finding`, and `report`; the prompt pack itself has no model client or orchestration loop, and it has not been evaluated end-to-end with an actual agent/model |
+| **CVE reachability assurance** | PTX now offers EXPOSED/LIKELY/UNDETERMINED/NOT_PRESENT assessments, but they are black-box heuristics; there is no source-level call/data-flow proof or independent real-app validation |
 | **crt.sh and Wayback** | Unreachable from this sandbox. Both modules fail honestly with exit 5, but neither has returned real data here |
-| **Environment fragility** | Sandbox resets wiped Flask and dnsutils mid-session. No dependency pinning or offline fallback yet |
+| **Network/tooling dependence** | Benchmark dependencies are pinned in `requirements.txt`, but the OSINT sources and optional system tools still depend on network/runtime availability; source failures must remain coverage gaps, not clean results |
 
 **Since that list was written**, three gaps closed: `ptx` exists and runs, the live
 CVE-lookup stage is verified against OSV.dev with real CVE identifiers, and the DNS/email-auth
 OSINT path works against a real domain.
 
-The single highest-value remaining step is CVE **reachability** assessment — the difference
-between "this dependency has 10 advisories" and "this dependency has 10 advisories and your
-app calls the vulnerable function with user input." Without it, version matching is scanner
-noise.
+The highest-value remaining work is validating the existing heuristic reachability ratings
+against independent applications and source-level ground truth, then evaluating the prompt
+pack end-to-end with a real model. A version match or visible component fingerprint is not
+proof that vulnerable code is reached with attacker-controlled input.

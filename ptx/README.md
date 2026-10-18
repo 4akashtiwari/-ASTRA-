@@ -70,6 +70,9 @@ ptx cve query <pkg> <ver> --ecosystem npm
 ptx osint dns <domain>
 ptx osint emailsec <domain>     # SPF/DMARC, include: chain enumeration
 ptx osint subs <domain>         # crt.sh certificate transparency
+ptx osint takeover <domain> [--hosts a.example.com,b.example.com]
+    # DNS-only by default; --confirm-third-party opts into up to two rate-limited GETs per
+    # candidate through the target hostname (HTTPS then HTTP; no redirects), only with RoE permission
 ptx osint wayback <domain>      # CDX URL history, JS bundle + parameter mining
 
 # Suspicion Ledger — findings stop being binary
@@ -336,7 +339,7 @@ and the last is the scope-exclusion bug's twin in another module.
 | **The report contradicted itself about coverage** | **MEDIUM** | One section said *"No coverage gaps were logged. Treat that with suspicion"* and twenty lines later the Coverage section listed **nineteen** probe classes that had never run. The two sections meant different things by "gap" — one counted OSINT/recon gaps, the other untested probe classes — and a reader cannot tell. Now the first says explicitly what it counts and points at the section that does have something to report |
 | **Every finding's remediation was blank** | **HIGH** | `from_probe` hardcoded `"remediation": ""`, while every probe writes its fix as the sixth positional argument to `_verdict`, which lands in `teaching`. So the report printed `#### Remediation / _not recorded_` on **every** finding, with the actual advice one heading lower under "Teaching note". A pentest report whose remediation column is always blank reads as though the tool had nothing to say. Now remediation is populated from the probe, and the teaching note prints only when it genuinely differs, so the advice appears once |
 | **The report advised testing the bypass URL it had just used** | **MEDIUM** | The acl-bypass probe's evidence names the variant that worked — `/ADMIN/PANEL` for `/admin/panel` — and the endpoint scraper added it to the inventory, so the untested-pairs table listed `acl-bypass` × `/ADMIN/PANEL`. Endpoint comparison is now case-insensitive: HTTP paths are case-sensitive, but for a checklist of "which routes have you tried this class on" they are one route |
-| **The takeover scan fired unthrottled at third parties** | **MEDIUM** | The confirmation requests go to GitHub, Heroku and Amazon — not to the target — and the scan had no rate limit at all. Across a domain with a few thousand subdomains that is a volume attack on someone else's infrastructure and a fast way to get the operator's egress IP blocked. Now a thread-safe `_Throttle` at the engagement's ceiling (`--rate`, default 5/s). **Thread-safe on purpose:** the unlocked version of this exact bug was already found in `probes.Http`, where ten threads read the same `_last`, computed the same wait and fired together — 48 req/s against a 5 req/s ceiling. Measured here: 40 requests across 10 threads at a 5 req/s ceiling → **5.1 req/s** |
+| **The takeover scan fired unthrottled at third parties** | **MEDIUM** | The confirmation requests can reach hosting providers behind the target's CNAME, and an unbounded fan-out could become volume against infrastructure the operator does not own. The fix is a thread-safe `_Throttle` clamped to the engagement ceiling (`--rate`, default 5/s), plus an explicit `--confirm-third-party` opt-in; DNS-only is the default, and confirmation does not follow redirects. **Thread-safe on purpose:** the unlocked version of this bug was measured at 48 req/s against a 5 req/s ceiling; the fixed throttle measured 5.1 req/s across 40 requests. |
 | **The coverage report went silent on a brand-new engagement** | **HIGH** | `render()` returned early when `actions_recorded == 0`, so an engagement that had run nothing printed one sentence and **no gap list at all**. That is backwards: what has not been run is known exactly, and it is the part of the report the operator needs most before starting. The warning stays; the early return does not |
 | **`assessment_type` was a control with no reader — the fourth** | **MEDIUM** | Written to `scope.yaml`, printed by `ptx status`, and read by nothing. It accepts `blackbox`/`greybox`/`whitebox`. It matters because a blackbox engagement has no credentials, so the eight classes that assume an authenticated identity *cannot* be run — and listing them under "never run at all" told the operator they had forgotten something that was never reachable. A gap list containing unreachable items gets skimmed, which hides the real ones. Now split into *"Not runnable without credentials (8)"* and *"Never run at all (12)"*, sourced from `chains.REQUIRES` so the two files cannot drift. **Wiring it exposed a fifth instance of the same shape:** the first attempt read the value inside `try: … except Exception: pass`, and `load_scope` takes an *engagement directory*, not a path to `scope.yaml` — so it raised `FileNotFoundError`, the bare except swallowed it, and the feature looked wired up while doing nothing |
 | **Two probes crashed or lied when their argument was missing** | **HIGH** | The CLI leaves `--marker` and `--canary-url` at `None`. `probe_traversal` did `marker in r["body"]`, which raised `TypeError: 'in <string>' requires string as left operand, not NoneType` — a traceback on the probe's own default invocation. `probe_ssrf` was worse and quieter: it built the URL `None?name=<token>`, asked the target to fetch that, and reported **`not vulnerable`** when the token naturally did not come back. It tested nothing and recorded a clean result. Both now return `inconclusive` with the exact flag to supply, and coverage lists them under *attempted but never measured* |
@@ -872,10 +875,10 @@ After the fixes: **71/71 across six consecutive runs, editing a file before each
 ## Test suite
 
 ```bash
-python3 tests/test_ptx.py          # 493 tests (incl. randomised differential testing)
+python3 -m unittest tests.test_ptx       # 506 tests (incl. randomised differential testing)
 
-python3 tests/property_targets.py 40    # 280 decisions against generated applications
-PTX_PROP_SEEDS=100 python3 tests/test_ptx.py   # more seeds
+python3 tests/property_targets.py 40    # 480 decisions against generated applications
+PTX_PROP_SEEDS=100 python3 -m unittest tests.test_ptx   # more seeds
 ```
 
 The suite runs every probe against **two targets** — the deliberately vulnerable benchmark
@@ -923,7 +926,7 @@ rather than a hand-written dict — the same discipline that exposed four earlie
 "bugs" as four wrong fixtures.
 
 ```bash
-python3 -m coverage run --source=ptx/ptxlib,ptx/ptx.py --branch tests/test_ptx.py
+python3 -m coverage run --source=ptx/ptxlib,ptx/ptx.py --branch -m unittest tests.test_ptx
 python3 -m coverage report -m
 ```
 
@@ -987,7 +990,9 @@ What remains uncovered is honest: live TLS handshakes against a real remote host
 - **Reachability is heuristic, not proven.** `LIKELY` means "server-side and loaded", not
   "the vulnerable function is called with user input". Closing that properly needs source
   access or grey-box testing.
-- **Rate limiting is per-probe only** (`--rate`), not enforced globally from scope.yaml.
+- **Rate limiting is per command/client, not one global cross-process budget.** Each command
+  clamps `--rate` to `scope.yaml`'s ceiling; two concurrent commands can still exceed that
+  aggregate ceiling. State-changing race probes deliberately use a bounded concurrent burst.
 - **Live OSINT sources are unproven here** — crt.sh and Wayback were unreachable from this
   sandbox; both fail honestly with exit 5.
 - **Report has no attack-narrative section.** Findings are listed individually; the chains

@@ -16,8 +16,9 @@ It is two halves that reinforce each other:
 
 ## Safety model (non-negotiable, enforced in code)
 
-- **Scope-gated.** Nothing touches the network without a recorded `scope.yaml` and an
-  authorization basis. Third parties are noted, never tested.
+- **Scope-gated.** Network commands require a recorded `scope.yaml` and authorization basis.
+  Third-party services are not scanned by default; the takeover check's optional provider
+  confirmation is separately gated by `--confirm-third-party` and does not follow redirects.
 - **Destructive-gated.** State-changing probes refuse to run unless the engagement explicitly
   permits them.
 - **LLM-boundary redaction.** `ptx redact` replaces subject identifiers (host, URL authority,
