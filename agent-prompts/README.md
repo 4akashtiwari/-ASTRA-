@@ -41,9 +41,9 @@ roadmap.md                  the METHOD — what happens, in what order, with wha
 
 ## What the benchmark proved
 
-The harness plants **28 vulnerabilities** and **9 deliberately-absent conditions**
-(falsification traps) and scores the tool, not the target. Current: **28/28 detected, 9/9
-correctly not reported, 93/93 weighted.**
+The harness plants **33 vulnerabilities** and **15 deliberately-absent conditions**
+(falsification traps) and scores the tool, not the target. Current: **33/33 detected, 15/15
+correctly not reported, 114/114 weighted.**
 
 Those numbers were fiction until they were audited. Two separate rounds found oracles that
 could not fail:

@@ -3,7 +3,12 @@
 Recorded **before** running any probe, so scoring is a real test and not a confirmation
 exercise.
 
-## Planted — 23 vulnerabilities
+> **Historical snapshot.** This table was written when the harness planted 23
+> vulnerabilities. It has since grown to **33 planted / 15 deliberately-absent**; the
+> canonical, current list and the 114/114 weighted score live in `bench/scorecard.py`.
+> Kept as the original record — the enumeration below is not the full current set.
+
+## Planted — 23 vulnerabilities (historical; now 33 — see scorecard.py)
 
 | ID | Class | Location | Detection oracle |
 |---|---|---|---|

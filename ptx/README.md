@@ -872,7 +872,7 @@ After the fixes: **71/71 across six consecutive runs, editing a file before each
 ## Test suite
 
 ```bash
-python3 tests/test_ptx.py          # 460 tests (incl. randomised differential testing)
+python3 tests/test_ptx.py          # 493 tests (incl. randomised differential testing)
 
 python3 tests/property_targets.py 40    # 280 decisions against generated applications
 PTX_PROP_SEEDS=100 python3 tests/test_ptx.py   # more seeds
@@ -984,14 +984,10 @@ What remains uncovered is honest: live TLS handshakes against a real remote host
 - **`crt.sh` and Wayback never returned data here.** Both modules are written and fail
   honestly, but neither has produced a real subdomain list or URL history in this
   environment. They need a network that can reach them.
-- **No `recon` or `surface` commands.** Port scanning, service detection, crawling, JS
-  endpoint extraction and content discovery are still spec-only in the builder prompt.
 - **Reachability is heuristic, not proven.** `LIKELY` means "server-side and loaded", not
   "the vulnerable function is called with user input". Closing that properly needs source
   access or grey-box testing.
 - **Rate limiting is per-probe only** (`--rate`), not enforced globally from scope.yaml.
-- **No `recon` command** — port scanning, service detection and TLS review are still
-  spec-only.
 - **Live OSINT sources are unproven here** — crt.sh and Wayback were unreachable from this
   sandbox; both fail honestly with exit 5.
 - **Report has no attack-narrative section.** Findings are listed individually; the chains
