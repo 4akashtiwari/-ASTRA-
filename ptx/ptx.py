@@ -250,7 +250,7 @@ def cmd_osint_takeover(args):
     else:
         subs = osint.subdomains(args.domain, timeout=args.timeout)
         osint.save(args.engagement, "subs", subs)
-        hosts = subs["hosts"]
+        hosts = subs["subdomains"]
         source = f"enumerated from {args.domain}"
 
     if not hosts:
@@ -264,8 +264,18 @@ def cmd_osint_takeover(args):
         return EXIT_UNREACHABLE
 
     # Throttle to the engagement's ceiling. These requests go to third parties, so the
-    # ceiling is a courtesy and an operational safeguard, not a scope rule.
-    res = takeover.scan(hosts, timeout=args.timeout, rps=args.rate or 5)
+    # ceiling is a courtesy and an operational safeguard, not a scope rule. This comment
+    # always claimed the clamp; the code passed args.rate straight through and never read
+    # rate_ceiling_rps, so a lower configured ceiling was silently exceeded.
+    rps = args.rate or 5
+    try:
+        raw = sc.data.get("rate_ceiling_rps")
+        ceiling = float(raw) if raw else None
+    except (TypeError, ValueError):
+        ceiling = None
+    if ceiling:
+        rps = min(ceiling, rps)
+    res = takeover.scan(hosts, timeout=args.timeout, rps=rps)
     osint.save(args.engagement, "takeover", res)
     emit(args, res["summary_lines"], res)
 
@@ -462,6 +472,11 @@ DESTRUCTIVE = {
                        "viewer's browser until someone deletes it",
     "double-spend":    "applies a one-time action twice, consuming it and moving account state",
     "race-consume":    "fires concurrent state-changing requests at a single-use operation",
+    # Replays the privileged WRITE requests the caller named, using a forged session
+    # cookie. Those are POSTs that change state, so this belongs behind the same gate as
+    # every other mutating probe. It was missing, so `--destructive-ok` was never required
+    # and the forged-session writes fired without explicit permission.
+    "session-forge":   "replays privileged write requests with a forged session cookie",
 }
 
 
@@ -1054,6 +1069,21 @@ def _save_recon(engagement, what, host, payload):
         json.dump(payload, f, indent=2, default=str)
 
 
+def _parse_host_port(target):
+    """Split an optional :port off a target host. Returns (host, port_or_None).
+
+    recon's help advertises host[:port], but the socket layer needs a bare hostname —
+    "1.2.3.4:5001" used as a hostname fails name resolution (verified). Only a single
+    trailing :digits is treated as a port; an IPv6 literal (two or more colons) is left
+    intact rather than split at the wrong colon.
+    """
+    if target.count(":") == 1:
+        h, _, p = target.partition(":")
+        if p.isdigit() and h:
+            return h, int(p)
+    return target, None
+
+
 def cmd_recon(args):
     """Ports / TLS / HTTP fingerprint. Scope-gated like every other network command."""
     sc, reason = _require_in_scope(args)
@@ -1067,15 +1097,20 @@ def cmd_recon(args):
         rps = min(ceiling, rps) if rps else ceiling
     print(f"  scope: {reason} | rate ceiling {rps or 'unset'} req/s", file=sys.stderr)
 
-    host = args.target
+    # The help advertises host[:port]. Split it once, here, so the socket layer gets a bare
+    # hostname — passing "1.2.3.4:5001" as a hostname fails name resolution. An explicit
+    # port becomes the port to scan / connect when the branch has no other source. (The
+    # http branch builds a URL from args.target, where host:port is already correct.)
+    host, explicit_port = _parse_host_port(args.target)
     statemod.log_action(args.engagement, "recon", f"recon {args.what} {host}", host,
                         "started")
     if args.what == "ports":
-        res = recon.ports(host, args.ports, timeout=args.timeout, rps=rps)
+        spec = args.ports or (str(explicit_port) if explicit_port else None)
+        res = recon.ports(host, spec, timeout=args.timeout, rps=rps)
         wrapped = {"host": host, "ports": res, "coverage_gaps": res.get("coverage_gaps", [])}
         payload = res
     elif args.what == "tls":
-        payload = recon.tls(host, args.port, timeout=args.timeout)
+        payload = recon.tls(host, explicit_port or args.port, timeout=args.timeout)
         wrapped = {"host": host, "tls": [payload],
                    "coverage_gaps": payload.get("coverage_gaps", [])}
     elif args.what == "http":
@@ -1153,8 +1188,19 @@ def cmd_chain(args):
         c = sum(1 for w in walked if w["verdict"] == "CANNOT_ATTEMPT")
         lines.append(f"walked: {d} demonstrated, {n} broke (escalation withdrawn), "
                      f"{c} could not be attempted")
+    # The walked results carry the forged token / session values that proved the chain.
+    # Those are live credentials; the human-readable render above already describes the
+    # demonstration without them, so mask them before they reach --json or a saved report.
+    def _mask_walk(w):
+        out = dict(w)
+        for k in list(out):
+            if isinstance(out[k], str) and any(
+                    t in k.lower() for t in ("token", "cookie", "credential", "password", "secret")):
+                out[k] = probes._mask_secret(out[k])
+        return out
     emit(args, lines, {"chains": ch, "de_escalations": de,
-                       "escalated": [x["entry"] for x in esc], "walked": walked})
+                       "escalated": [x["entry"] for x in esc],
+                       "walked": [_mask_walk(w) for w in walked]})
 
 
 def cmd_reliability(args):

@@ -11,10 +11,24 @@ Two rules that came from real failures in this project:
    benchmark target and `&&` did not — because ping fails without raw sockets, so the
    chained command never fired. Report only what you demonstrate.
 """
-import base64, json, re, threading, time, urllib.error, urllib.parse, urllib.request
+import base64, hashlib, json, re, threading, time, urllib.error, urllib.parse, urllib.request
 import http.cookiejar
 
 CANARY_N = [0]
+
+
+def _mask_secret(s):
+    """A credential is evidence by its SHAPE, never by its value.
+
+    Session cookies and forged tokens end up in a verdict's `extra`, which `--json`
+    serialises and a report may embed. Printing the raw value hands a live credential to
+    whoever reads the output — the exact thing the tool's own rules forbid. Show the length
+    and a short digest instead: enough to tell two tokens apart and to match one across
+    runs, with nothing reusable leaked.
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    return f"<masked {len(s)}b sha256:{hashlib.sha256(s.encode()).hexdigest()[:12]}>"
 
 
 def canary(tag):
@@ -1226,7 +1240,8 @@ def probe_session_forge(h, paths, seed_path="/", method="GET", post_body=None,
                         "endpoint": f"{m} {p}", "genuine_code": b_code,
                         "forged_code": r["code"],
                         "genuine_len": len(b_body), "forged_len": len(r["body"]),
-                        "genuine_cookie": genuine, "forged_cookie": forged_cookie,
+                        "genuine_cookie": _mask_secret(genuine),
+                        "forged_cookie": _mask_secret(forged_cookie),
                     })
                     break
             if hits:

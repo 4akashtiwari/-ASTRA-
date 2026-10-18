@@ -4,6 +4,8 @@
 # stays on the operator's machine. These paths hold that identity in the clear.
 # ============================================================================
 engagements/
+engagement/            # the CLI's DEFAULT engagement dir (--engagement engagement)
+**/identities.json     # stored session cookies — 0600 at rest, never published
 **/redaction-map.json
 uploads/
 dryrun/

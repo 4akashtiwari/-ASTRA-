@@ -2813,7 +2813,7 @@ class TestDestructiveGate(unittest.TestCase):
     PTX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "ptx", "ptx.py")
     DESTRUCTIVE = ("race", "csrf", "refund-abuse", "negative-qty", "price-tamper", "stored-xss",
-                   "workflow-bypass", "method-tamper")
+                   "workflow-bypass", "method-tamper", "session-forge")
     NON_DESTRUCTIVE = ("exposure", "headers", "sqli", "xss", "traversal")
 
     def _engage(self, destructive):
@@ -5232,6 +5232,12 @@ class TestSessionTokenForgeability(ServerFixture, unittest.TestCase):
         self.assertEqual(hit["cookie"], "session")
         self.assertEqual(hit["token_kind"], "base64-json")
         self.assertIn("role", hit["forged"])
+        # Review fix #2: the raw genuine/forged cookies ride along in `hits`, which --json
+        # serialises and a report may embed. They must be masked — a live session cookie in
+        # the output is a leaked credential, the exact thing the tool's own rules forbid.
+        self.assertIn("masked", hit["genuine_cookie"])
+        self.assertIn("masked", hit["forged_cookie"])
+        self.assertNotIn("eyJ", hit["forged_cookie"])  # no raw base64 token survives
 
     def test_the_proof_is_a_write_not_a_read(self):
         """Replaying only GETs finds nothing here, because the listing is identical for a
@@ -6525,3 +6531,37 @@ class TestVariants(unittest.TestCase):
         self.assertIsNotNone(variants.retest_probe("jwt-none"))   # takes (h, path)
         self.assertIsNone(variants.retest_probe("idor"))          # needs a second identity
         self.assertIsNone(variants.retest_probe("double-spend"))  # stateful, no location
+
+
+class TestReviewFixes(unittest.TestCase):
+    """Regressions pinned from the external repo review (uploads/ASTRA-repo-review.md)."""
+
+    def test_parse_host_port_splits_an_explicit_port(self):
+        import ptx as ptxmod
+        # The bug: recon's help advertises host[:port] but the raw string was passed to the
+        # socket layer, so "1.2.3.4:5001" was used as a hostname and failed to resolve.
+        self.assertEqual(ptxmod._parse_host_port("1.2.3.4:5001"), ("1.2.3.4", 5001))
+        self.assertEqual(ptxmod._parse_host_port("example.com"), ("example.com", None))
+        self.assertEqual(ptxmod._parse_host_port("::1"), ("::1", None))  # not a port
+
+    def test_mask_secret_never_returns_the_value(self):
+        s = "session=abc123SUPERsecretVALUE"
+        m = probes._mask_secret(s)
+        self.assertNotIn("SUPERsecretVALUE", m)
+        self.assertNotIn(s, m)
+        self.assertIn("masked", m)
+        self.assertEqual(probes._mask_secret(""), "")    # empty passes through
+        self.assertIsNone(probes._mask_secret(None))     # non-string passes through
+
+    def test_redaction_map_is_written_owner_only(self):
+        # The map holds the ORIGINAL values (including secrets) the redactor replaced. A
+        # world-readable map next to a redacted document undoes the whole redaction.
+        import stat
+        from ptxlib import redact
+        d = tempfile.mkdtemp(prefix="ptxmap")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "redaction-map.json")
+        redact.Redactor().save(p)
+        mode = stat.S_IMODE(os.stat(p).st_mode)
+        self.assertEqual(mode, 0o600, f"redaction map is {oct(mode)}, must be 0600")
+        self.assertFalse(os.path.exists(p + ".tmp"), "atomic write left a temp file behind")

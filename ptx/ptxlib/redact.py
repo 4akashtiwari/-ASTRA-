@@ -24,6 +24,7 @@ before something leaves the machine.
 
 import collections
 import json
+import os
 import re
 import urllib.parse
 
@@ -173,8 +174,14 @@ class Redactor:
         return r
 
     def save(self, path):
-        with open(path, "w") as f:
+        # The map holds the ORIGINAL values the redactor replaced — including any secrets.
+        # Write it owner-only (0600) and atomically, matching identities.py: a world-readable
+        # reversal map sitting next to a redacted document undoes the entire redaction.
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(self.to_dict(), f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path, subjects=()):
