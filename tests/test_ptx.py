@@ -7,7 +7,7 @@ fixed in this project. Every one of those bugs was the same species — the tool
 something false with confidence. That is why the suite is weighted toward asserting what
 the tool says when it does NOT know, not just when it does.
 
-Run: python3 tests/test_ptx.py
+Run: python3 -m unittest tests.test_ptx
 """
 import base64, json, os, shutil, socket, subprocess, sys, tempfile, threading, time
 import unittest
@@ -6534,7 +6534,19 @@ class TestVariants(unittest.TestCase):
 
 
 class TestReviewFixes(unittest.TestCase):
-    """Regressions pinned from the external repo review (uploads/ASTRA-repo-review.md)."""
+    """Regressions pinned from the review plus independently reproduced follow-up bugs."""
+
+    def _make_engagement(self, target="127.0.0.1", in_scope=None):
+        PTX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "ptx", "ptx.py")
+        d = tempfile.mkdtemp(prefix="ptxreview")
+        self.addCleanup(shutil.rmtree, d, True)
+        allowed = in_scope or [target]
+        r = subprocess.run([sys.executable, PTX, "--engagement", d, "scope", "init", target,
+                            "--in-scope", *allowed, "--authorization", "test", "--rate", "30"],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return d, PTX
 
     def test_parse_host_port_splits_an_explicit_port(self):
         import ptx as ptxmod
@@ -6542,7 +6554,10 @@ class TestReviewFixes(unittest.TestCase):
         # socket layer, so "1.2.3.4:5001" was used as a hostname and failed to resolve.
         self.assertEqual(ptxmod._parse_host_port("1.2.3.4:5001"), ("1.2.3.4", 5001))
         self.assertEqual(ptxmod._parse_host_port("example.com"), ("example.com", None))
-        self.assertEqual(ptxmod._parse_host_port("::1"), ("::1", None))  # not a port
+        self.assertEqual(ptxmod._parse_host_port("::1"), ("::1", None))
+        self.assertEqual(ptxmod._parse_host_port("[::1]:5001"), ("::1", 5001))
+        self.assertEqual(ptxmod._parse_host_port("https://[2001:db8::1]:8443/x"),
+                         ("2001:db8::1", 8443))
 
     def test_mask_secret_never_returns_the_value(self):
         s = "session=abc123SUPERsecretVALUE"
@@ -6552,6 +6567,41 @@ class TestReviewFixes(unittest.TestCase):
         self.assertIn("masked", m)
         self.assertEqual(probes._mask_secret(""), "")    # empty passes through
         self.assertIsNone(probes._mask_secret(None))     # non-string passes through
+
+    def test_default_engagement_and_identity_paths_are_git_ignored(self):
+        import uuid
+        root = ROOT
+        engagement_root = os.path.join(root, "engagement")
+        engagement_existed = os.path.isdir(engagement_root)
+        tag = "ptx-ignore-" + uuid.uuid4().hex
+        paths = [os.path.join(engagement_root, tag, "scope.yaml"),
+                 os.path.join(root, tag, "identities.json")]
+        created_dirs = []
+        try:
+            for path in paths:
+                parent = os.path.dirname(path)
+                os.makedirs(parent, exist_ok=True)
+                created_dirs.append(parent)
+                with open(path, "w") as f:
+                    f.write("test")
+                r = subprocess.run(["git", "check-ignore", "-q", path], cwd=root)
+                self.assertEqual(r.returncode, 0, f"{path} is not ignored")
+        finally:
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            for directory in sorted(set(created_dirs), key=len, reverse=True):
+                try:
+                    os.rmdir(directory)
+                except OSError:
+                    pass
+            if not engagement_existed:
+                try:
+                    os.rmdir(engagement_root)
+                except OSError:
+                    pass
 
     def test_redaction_map_is_written_owner_only(self):
         # The map holds the ORIGINAL values (including secrets) the redactor replaced. A
@@ -6566,28 +6616,237 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(mode, 0o600, f"redaction map is {oct(mode)}, must be 0600")
         self.assertFalse(os.path.exists(p + ".tmp"), "atomic write left a temp file behind")
 
+    def test_redaction_map_replaces_a_preexisting_permissive_temp_safely(self):
+        import stat
+        from ptxlib import redact
+        d = tempfile.mkdtemp(prefix="ptxmap-oldtmp")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "redaction-map.json")
+        with open(p + ".tmp", "w") as f:
+            f.write("do not touch")
+        os.chmod(p + ".tmp", 0o644)
+        red = redact.Redactor()
+        red._to_real["PTX_HOST_1"] = "private.example"
+        red._to_ph["private.example"] = "PTX_HOST_1"
+        red.save(p)
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600,
+                         "pre-existing .tmp mode leaked to the secret map")
+        with open(p + ".tmp") as f:
+            self.assertEqual(f.read(), "do not touch", "save reused/truncated the fixed temp path")
+        leftovers = [n for n in os.listdir(d) if n not in ("redaction-map.json", "redaction-map.json.tmp")]
+        self.assertEqual(leftovers, [], f"atomic writer left temp artifacts: {leftovers}")
+
     def test_url_host_extracts_the_destination(self):
         import ptx as ptxmod
         self.assertEqual(ptxmod._url_host("https://github.com/o/r.git"), "github.com")
-        self.assertEqual(ptxmod._url_host("https://user@host.com:8443/x"), "host.com")
+        self.assertEqual(ptxmod._url_host("https://host.com:8443/x"), "host.com")
+        with self.assertRaises(ValueError):
+            ptxmod._url_host("https://user@host.com:8443/x")
         self.assertEqual(ptxmod._url_host("git@github.com:o/r.git"), "github.com")
         self.assertIsNone(ptxmod._url_host("/local/path/repo"))  # a local path has no host
+        # A query is not the authority. The old split-based parser returned the allowed
+        # suffix here and let Git clone the actual out-of-scope host.
+        self.assertEqual(ptxmod._url_host(
+            "https://evil.invalid?x=.allowed.example/repo.git"), "evil.invalid")
+        self.assertEqual(ptxmod._url_host("https://[2001:db8::1]:8443/repo.git"),
+                         "2001:db8::1")
+        with self.assertRaises(ValueError):
+            ptxmod._url_host("file:///etc/passwd")
+
+    def test_git_clone_failure_does_not_echo_url_credentials(self):
+        from types import SimpleNamespace
+        secret = "PAT_SHOULD_NEVER_APPEAR_8271"
+        repo = f"https://example.test/repo.git?token={secret}"
+        fake = SimpleNamespace(returncode=128, stderr=f"fatal: {repo}".encode())
+        with unittest.mock.patch("subprocess.run", return_value=fake):
+            result = probes.probe_git_history_leak(repo)
+        blob = json.dumps(result)
+        self.assertNotIn(secret, blob)
+        self.assertNotIn(repo, blob)
+
+    def test_git_history_scan_failure_is_unmeasured_not_clean(self):
+        from types import SimpleNamespace
+        fake = SimpleNamespace(returncode=128, stdout="", stderr=b"not a repository")
+        with unittest.mock.patch("subprocess.run", return_value=fake):
+            result = probes.probe_git_history_leak("/tmp/not-a-repository")
+        self.assertFalse(result["vulnerable"])
+        self.assertTrue(result["inconclusive"])
+        self.assertIn("no clean conclusion", result["evidence"])
 
     def test_secondary_destination_outside_scope_is_blocked(self):
-        # git-history-leak clones --repo, a destination the --base check never saw. An
-        # out-of-scope repo host must be refused, not cloned, so "the base is authorized"
-        # cannot become a way to reach an arbitrary host.
-        PTX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "ptx", "ptx.py")
-        d = tempfile.mkdtemp(prefix="ptxscope2")
-        self.addCleanup(shutil.rmtree, d, True)
-        subprocess.run([sys.executable, PTX, "--engagement", d, "scope", "init", "127.0.0.1",
-                        "--in-scope", "127.0.0.1", "--authorization", "test", "--rate", "30"],
-                       capture_output=True, text=True, timeout=60)
+        # `--repo` is checked before git clone; both an ordinary URL and a query-smuggled
+        # URL must be refused without touching the remote.
+        d, PTX = self._make_engagement()
+        for repo in ("https://evil.example.com/x.git",
+                     "https://evil.example.com?x=.127.0.0.1/x.git"):
+            with self.subTest(repo=repo):
+                r = subprocess.run(
+                    [sys.executable, PTX, "--engagement", d, "probe", "git-history-leak",
+                     "--base", "http://127.0.0.1:5999", "--repo", repo],
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 3)  # EXIT_SCOPE
+                self.assertIn("SCOPE BLOCKED", r.stderr)
+                self.assertIn("evil.example.com", r.stderr)
+
+    def test_primary_target_query_cannot_smuggle_an_in_scope_suffix(self):
+        d, PTX = self._make_engagement()
         r = subprocess.run(
-            [sys.executable, PTX, "--engagement", d, "probe", "git-history-leak",
-             "--base", "http://127.0.0.1:5999", "--repo", "https://evil.example.com/x.git"],
+            [sys.executable, PTX, "--engagement", d, "probe", "headers", "--base",
+             "http://evil.example.invalid?x=.127.0.0.1"],
             capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 3)  # EXIT_SCOPE
+        self.assertEqual(r.returncode, 3)
         self.assertIn("SCOPE BLOCKED", r.stderr)
-        self.assertIn("evil.example.com", r.stderr)
+        self.assertIn("evil.example.invalid", r.stderr)
+
+    def test_takeover_hosts_are_parsed_before_domain_suffix_check(self):
+        d, PTX = self._make_engagement("example.test")
+        r = subprocess.run(
+            [sys.executable, PTX, "--engagement", d, "osint", "takeover", "example.test",
+             "--hosts", "evil.invalid?x=.example.test"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("SCOPE BLOCKED", r.stderr)
+
+    def test_scope_parser_handles_queries_ports_and_ipv6(self):
+        from ptxlib.scope import Scope
+        d = tempfile.mkdtemp(prefix="ptxscopeparse")
+        self.addCleanup(shutil.rmtree, d, True)
+        scope_file = os.path.join(d, "scope.yaml")
+        with open(scope_file, "w") as f:
+            f.write("target: example.test\nin_scope:\n  - example.test\n"
+                    "  - ::1/128\nauthorization: test\nrate_ceiling_rps: 5\n")
+        sc = Scope(scope_file)
+        self.assertFalse(sc.is_in_scope("https://evil.invalid?x=.example.test")[0])
+        self.assertTrue(sc.is_in_scope("https://www.example.test:8443/path")[0])
+        self.assertTrue(sc.is_in_scope("http://[::1]:5001/")[0])
+
+    def test_negative_or_invalid_rates_fail_closed(self):
+        import ptx as ptxmod
+        from ptxlib.takeover import _Throttle
+        args = type("Args", (), {"rate": -1})()
+        with self.assertRaises(SystemExit) as err:
+            ptxmod._requested_rate(args)
+        self.assertEqual(err.exception.code, ptxmod.EXIT_USAGE)
+        with self.assertRaises(ValueError):
+            probes.Http("http://127.0.0.1", rps=-1)
+        with self.assertRaises(ValueError):
+            _Throttle(rps=-1)
+        sc = type("Scope", (), {"data": {"rate_ceiling_rps": "0"}})()
+        with self.assertRaises(SystemExit) as err:
+            ptxmod._effective_rate(sc, 5, default=None)
+        self.assertEqual(err.exception.code, ptxmod.EXIT_SCOPE)
+        sc.data["rate_ceiling_rps"] = "2"
+        self.assertEqual(ptxmod._effective_rate(sc, 10, default=5), 2.0)
+
+    def test_takeover_does_not_contact_provider_without_opt_in(self):
+        def dns(_host):
+            return "acme-labs.github.io."
+        with unittest.mock.patch.object(takeover, "_fetch") as live_fetch:
+            r = takeover.check_host("status.acme.test", runner=dns)
+        live_fetch.assert_not_called()
+        self.assertEqual(r["verdict"], "CANDIDATE")
+        self.assertIn("no HTTP request was sent", r["reason"])
+
+    def test_takeover_confirmation_requires_explicit_opt_in(self):
+        def dns(_host):
+            return "acme-labs.github.io."
+        with unittest.mock.patch.object(
+                takeover, "_fetch", return_value=(404, "There isn't a GitHub Pages site here.")) as live_fetch:
+            r = takeover.check_host("status.acme.test", runner=dns,
+                                    confirm_third_party=True)
+        live_fetch.assert_called_once()
+        self.assertEqual(r["verdict"], "TAKEOVER_LIKELY")
+
+    def test_takeover_https_fallback_is_another_rate_limited_request(self):
+        calls, waits = [], []
+
+        class Response:
+            status = 200
+            def read(self, _n):
+                return b"ok"
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+
+        class Opener:
+            def open(self, request, timeout):
+                calls.append((request.full_url, timeout))
+                if len(calls) == 1:
+                    raise urllib.error.URLError("TLS unavailable")
+                return Response()
+
+        with unittest.mock.patch.object(takeover.urllib.request, "build_opener",
+                                        return_value=Opener()):
+            status, body = takeover._fetch("service.acme.test", 1,
+                                           wait=lambda: waits.append("wait"))
+        self.assertEqual((status, body), (200, "ok"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(waits, ["wait"], "HTTP fallback was not separately throttled")
+
+    def test_takeover_default_enumeration_uses_subdomains_and_clamps_rate(self):
+        import ptx as ptxmod
+        import contextlib
+        d, _ = self._make_engagement("example.test")
+        scope_path = os.path.join(d, "scope.yaml")
+        with open(scope_path) as f:
+            scope_text = f.read()
+        with open(scope_path, "w") as f:
+            f.write(scope_text.replace("rate_ceiling_rps: 30", "rate_ceiling_rps: 1"))
+        args = type("Args", (), {"engagement": d, "domain": "example.test", "hosts": None,
+                                  "timeout": 1, "rate": 5, "confirm_third_party": False,
+                                  "json": True})()
+        subs = {"subdomains": ["api.example.test"], "summary_lines": [],
+                "enumerated": True}
+        scan_result = {"results": [], "unmeasured": [], "hosts_checked": 1,
+                       "summary_lines": []}
+        with contextlib.ExitStack() as stack:
+            enumerator = stack.enter_context(unittest.mock.patch.object(
+                ptxmod.osint, "subdomains", return_value=subs))
+            stack.enter_context(unittest.mock.patch.object(ptxmod.osint, "save"))
+            scan = stack.enter_context(unittest.mock.patch.object(
+                ptxmod.takeover, "scan", return_value=scan_result))
+            stack.enter_context(unittest.mock.patch.object(ptxmod, "emit"))
+            stack.enter_context(unittest.mock.patch.object(ptxmod.statemod, "log_action"))
+            rc = ptxmod.cmd_osint_takeover(args)
+        enumerator.assert_called_once_with("example.test", timeout=1)
+        self.assertEqual(rc, ptxmod.EXIT_NORESULT)
+        self.assertEqual(scan.call_args.args[0], ["api.example.test"])
+        self.assertEqual(scan.call_args.kwargs["rps"], 1.0)
+        self.assertFalse(scan.call_args.kwargs["confirm_third_party"])
+
+    def test_chain_walk_sanitization_is_recursive_for_json_and_text(self):
+        import contextlib, io
+        import ptx as ptxmod
+        secret = "SENTINEL_live_session_token_7482"
+        exposure = {"id": "PTX-001", "class": "exposure"}
+        fake_result = {"verdict": "DEMONSTRATED", "token": secret,
+                       "steps": [{"step": "server response", "detail": f"echoed {secret}"}],
+                       "evidence": f"accepted {secret}"}
+        args = type("Args", (), {"engagement": ".", "walk": True, "walk_login": None,
+                                  "walk_endpoint": "/me", "walk_admin_endpoint": "/admin",
+                                  "json": True, "rate": 0, "timeout": 1})()
+
+        def run_output(json_mode):
+            args.json = json_mode
+            out = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.object(
+                    ptxmod.fnd, "all_findings", return_value=[exposure]))
+                stack.enter_context(unittest.mock.patch.object(
+                    ptxmod.chains, "analyse", return_value=([], [])))
+                stack.enter_context(unittest.mock.patch.object(
+                    ptxmod, "_require_in_scope", return_value=(None, "test")))
+                stack.enter_context(unittest.mock.patch.object(
+                    ptxmod, "_client", return_value=(None, 5)))
+                stack.enter_context(unittest.mock.patch.object(
+                    ptxmod.chainwalk, "walk_secret_to_identity", return_value=fake_result))
+                with contextlib.redirect_stdout(out):
+                    ptxmod.cmd_chain(args)
+            return out.getvalue()
+
+        for mode in (True, False):
+            with self.subTest(json=mode):
+                output = run_output(mode)
+                self.assertNotIn(secret, output)
+                self.assertIn("masked", output)

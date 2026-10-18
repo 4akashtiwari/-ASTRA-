@@ -11,7 +11,7 @@ Two rules that came from real failures in this project:
    benchmark target and `&&` did not — because ping fails without raw sockets, so the
    chained command never fired. Report only what you demonstrate.
 """
-import base64, hashlib, json, re, threading, time, urllib.error, urllib.parse, urllib.request
+import base64, hashlib, json, math, re, threading, time, urllib.error, urllib.parse, urllib.request
 import http.cookiejar
 
 CANARY_N = [0]
@@ -42,6 +42,13 @@ class Http:
     def __init__(self, base, rps=None, timeout=15):
         self.base = base.rstrip("/")
         self.timeout = timeout
+        if rps is not None:
+            try:
+                rps = float(rps)
+            except (TypeError, ValueError) as e:
+                raise ValueError("rps must be a non-negative finite number") from e
+            if not math.isfinite(rps) or rps < 0:
+                raise ValueError("rps must be a non-negative finite number")
         self.min_interval = (1.0 / rps) if rps else 0
         self._last = 0.0
         self.jar = http.cookiejar.CookieJar()
@@ -2078,20 +2085,43 @@ def probe_git_history_leak(repo, extra_patterns=None):
     target = repo
     if re.match(r"^(https?://|git@)", repo):
         tmp = tempfile.mkdtemp(prefix="ptx-githist-")
-        c = subprocess.run(["git", "clone", "--quiet", repo, tmp],
-                           capture_output=True, timeout=300)
+        try:
+            c = subprocess.run(["git", "clone", "--quiet", repo, tmp],
+                               capture_output=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return _verdict("git-history-leak", "Secrets recoverable from git history", False,
+                            "git clone did not complete; no conclusion about repository history",
+                            "", "", None,
+                            extra={"inconclusive": True,
+                                   "inconclusive_reason": "clone unavailable or timed out"})
         if c.returncode != 0:
             shutil.rmtree(tmp, ignore_errors=True)
             return _verdict("git-history-leak", "Secrets recoverable from git history", False,
-                            f"could not clone {repo}: {c.stderr.decode()[:120]}",
+                            f"git clone failed (exit {c.returncode}); remote error details "
+                            "suppressed because they may contain credentials",
                             "", "", None,
                             extra={"inconclusive": True,
                                    "inconclusive_reason": "clone failed"})
         target = tmp
     try:
-        log = subprocess.run(["git", "-C", target, "log", "-p", "--all",
-                              "--no-color", "--date=short"],
-                             capture_output=True, text=True, timeout=600)
+        try:
+            log = subprocess.run(["git", "-C", target, "log", "-p", "--all",
+                                  "--no-color", "--date=short"],
+                                 capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired):
+            return _verdict("git-history-leak", "Secrets recoverable from git history", False,
+                            "git history scan did not complete; no clean conclusion was made",
+                            "", "", None,
+                            extra={"inconclusive": True,
+                                   "inconclusive_reason": "history scan unavailable or timed out"})
+        if log.returncode != 0:
+            return _verdict("git-history-leak", "Secrets recoverable from git history", False,
+                            f"git history scan failed (exit {log.returncode}); no clean "
+                            "conclusion was made",
+                            "", "", None,
+                            extra={"inconclusive": True,
+                                   "inconclusive_reason": "history scan failed"})
         text = log.stdout
         pats = dict(_GIT_SECRET_PATTERNS)
         if extra_patterns:

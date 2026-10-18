@@ -26,6 +26,7 @@ import collections
 import json
 import os
 import re
+import tempfile
 import urllib.parse
 
 # Placeholder shape: a distinctive prefix that will not occur in ordinary text, a KIND so the
@@ -175,13 +176,23 @@ class Redactor:
 
     def save(self, path):
         # The map holds the ORIGINAL values the redactor replaced — including any secrets.
-        # Write it owner-only (0600) and atomically, matching identities.py: a world-readable
-        # reversal map sitting next to a redacted document undoes the entire redaction.
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(self.to_dict(), f, indent=2, sort_keys=True)
-        os.replace(tmp, path)
+        # A fixed `.tmp` path can already exist with mode 0644 (or be a symlink), and
+        # os.open(..., 0o600) does not tighten an existing file's permissions. Create a
+        # unique owner-only sibling, then atomically replace the destination.
+        directory = os.path.dirname(os.path.abspath(path))
+        prefix = "." + os.path.basename(path) + "."
+        fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.to_dict(), f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = None
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
 
     @classmethod
     def load(cls, path, subjects=()):

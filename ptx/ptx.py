@@ -11,10 +11,10 @@ Built to be driven by an AI agent through a shell. Design rules (non-negotiable)
 
 Exit code 3 is the important one. The scope guard is code, not a prompt instruction.
 """
-import argparse, json, os, re, sys, time
+import argparse, ipaddress, json, math, os, re, sys, time, urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ptxlib.scope import ScopeViolation, load_scope
+from ptxlib.scope import ScopeViolation, canonical_host, load_scope
 from ptxlib import (cve, osint, state as statemod, probes, findings as fnd,
                     report as rpt, reachability, chains, reliability, integrity,
                     recon, chainwalk, coverage, takeover, discover, identities, redact,
@@ -230,39 +230,51 @@ def cmd_osint_subs(args):
 def cmd_osint_takeover(args):
     """Assess enumerated subdomains for dangling delegations to claimable services.
 
-    DETECTION ONLY. This reads a CNAME chain from public DNS and, where the chain
-    delegates to a third party, fetches that host once to see whether the service reports
-    the resource as unclaimed. It never registers or claims anything — claiming would be
-    an attack on a third party that is not the target and not covered by this
-    authorization, even though the dangling record makes it possible.
+    DETECTION ONLY. This reads a CNAME chain from public DNS. By default it sends no HTTP
+    request to the hosting service; `--confirm-third-party` explicitly opts into a
+    rate-limited GET through the target hostname (without following redirects). It never
+    registers or claims anything — claiming would be an attack on a third party that is not
+    the target and not covered by this authorization.
     """
     sc = require_scope(args, authorized=True)
     try:
-        sc.assert_in_scope(args.domain)
-    except ScopeViolation as e:
-        print(f"SCOPE BLOCKED: {e}", file=sys.stderr)
-        sc.log_scope_checks([], [{"host": args.domain, "reason": str(e)}])
+        dom = canonical_host(args.domain)
+        sc.assert_in_scope(dom)
+    except (ScopeViolation, ValueError) as e:
+        print(f"SCOPE BLOCKED: invalid or out-of-scope domain -> {e}", file=sys.stderr)
+        sc.log_scope_checks([], [{"host": "[invalid domain]", "reason": str(e)}])
         return EXIT_SCOPE
+    # The DNS/CT helpers take a bare domain, not a URL or host:port.
+    args.domain = dom
 
     if args.hosts:
-        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
-        # --hosts is caller-supplied and every host is fetched. They must be subdomains of
-        # the authorized domain, or --hosts becomes a way to point the takeover scan at
-        # arbitrary third parties the engagement never covered.
-        dom = (args.domain or "").lower().lstrip(".")
-        off = [h for h in hosts if not (h.lower() == dom or h.lower().endswith("." + dom))]
-        if off:
-            print(f"SCOPE BLOCKED: --hosts not under {args.domain}: {', '.join(off)}",
-                  file=sys.stderr)
-            sc.log_scope_checks([], [{"host": h, "reason": f"not under {args.domain}"}
-                                     for h in off])
-            return EXIT_SCOPE
-        source = f"{len(hosts)} host(s) supplied with --hosts"
+        requested_hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+        source = f"{len(requested_hosts)} host(s) supplied with --hosts"
     else:
-        subs = osint.subdomains(args.domain, timeout=args.timeout)
+        subs = osint.subdomains(dom, timeout=args.timeout)
         osint.save(args.engagement, "subs", subs)
-        hosts = subs["subdomains"]
-        source = f"enumerated from {args.domain}"
+        requested_hosts = subs["subdomains"]
+        source = f"enumerated from {dom}"
+
+    # Normalize and independently check every host, including results from passive OSINT.
+    # A suffix test on the raw string lets `evil.invalid?x=.example.com` masquerade as an
+    # authorized subdomain and then be fetched by the confirmation check.
+    hosts, off = [], []
+    for raw_host in requested_hosts:
+        try:
+            host = canonical_host(raw_host)
+            if host != dom and not host.endswith("." + dom):
+                raise ValueError(f"not a subdomain of {dom}")
+            sc.assert_in_scope(host)
+            hosts.append(host)
+        except (ScopeViolation, ValueError) as e:
+            off.append({"host": str(raw_host), "reason": str(e)})
+    if off:
+        print("SCOPE BLOCKED: takeover host list contains an invalid or out-of-scope "
+              f"destination ({len(off)} rejected)", file=sys.stderr)
+        sc.log_scope_checks([], off)
+        return EXIT_SCOPE
+    hosts = list(dict.fromkeys(hosts))  # duplicates must not cause duplicate requests
 
     if not hosts:
         lines = ["subdomain takeover — NO HOSTS TO ASSESS"]
@@ -274,19 +286,11 @@ def cmd_osint_takeover(args):
         emit(args, lines, {"results": [], "hosts_checked": 0})
         return EXIT_UNREACHABLE
 
-    # Throttle to the engagement's ceiling. These requests go to third parties, so the
-    # ceiling is a courtesy and an operational safeguard, not a scope rule. This comment
-    # always claimed the clamp; the code passed args.rate straight through and never read
-    # rate_ceiling_rps, so a lower configured ceiling was silently exceeded.
-    rps = args.rate or 5
-    try:
-        raw = sc.data.get("rate_ceiling_rps")
-        ceiling = float(raw) if raw else None
-    except (TypeError, ValueError):
-        ceiling = None
-    if ceiling:
-        rps = min(ceiling, rps)
-    res = takeover.scan(hosts, timeout=args.timeout, rps=rps)
+    # The optional confirmation GET is rate-limited and also needs its explicit opt-in.
+    # A negative rate used to produce a negative wait interval, i.e. no throttle at all.
+    rps = _effective_rate(sc, _requested_rate(args), default=5)
+    res = takeover.scan(hosts, timeout=args.timeout, rps=rps,
+                        confirm_third_party=args.confirm_third_party)
     osint.save(args.engagement, "takeover", res)
     emit(args, res["summary_lines"], res)
 
@@ -441,18 +445,27 @@ def cmd_selfcheck(args):
 def _require_in_scope(args):
     """Enforce the scope boundary for any command that touches a network target.
 
-    require_scope() only checks that a scope FILE exists. That is not enough: without
-    this, `ptx probe --base http://anything` happily attacks a host that was never
-    authorized. Verified bug — the scope guard was not guarding the probe commands.
+    Parse the target with the same URL rules as the network client. String-splitting a URL
+    let its query/fragment masquerade as the hostname, e.g. an out-of-scope authority ending
+    in `?x=.in-scope.example`. Invalid or ambiguous targets fail closed before any request.
     """
     sc = require_scope(args, authorized=True)
-    # Commands name their target differently: probes use --base, recon uses a positional.
-    # A guard that only understands one of them is a guard with a hole in it.
-    host = getattr(args, "base", None) or getattr(args, "target", None)
-    if not host:
+    target = getattr(args, "base", None) or getattr(args, "target", None)
+    if not target:
         print("internal error: no target on this command to scope-check", file=sys.stderr)
         sys.exit(EXIT_SCOPE)
-    host = host.split("://")[-1].split("/")[0].split(":")[0] or host
+    try:
+        host = canonical_host(target)
+    except ValueError as e:
+        reason = f"invalid target: {e}"
+        print(f"SCOPE BLOCKED: {reason}", file=sys.stderr)
+        sc.log_scope_checks([], [{"host": "[invalid target]", "reason": reason}])
+        sys.exit(EXIT_SCOPE)
+    if getattr(args, "base", None) and ("?" in target or "#" in target):
+        reason = "base URL must not contain a query or fragment; use a clean origin/path"
+        print(f"SCOPE BLOCKED: {host} -> {reason}", file=sys.stderr)
+        sc.log_scope_checks([], [{"host": host, "reason": reason}])
+        sys.exit(EXIT_SCOPE)
     try:
         reason = sc.assert_in_scope(host)
     except ScopeViolation as e:
@@ -463,31 +476,81 @@ def _require_in_scope(args):
 
 
 def _url_host(url):
-    """The host a URL (or scp-style git target) will reach, or None for a local path."""
-    if "://" in url:
-        return url.split("://", 1)[1].split("/")[0].split("@")[-1].split(":")[0] or None
-    if "@" in url and ":" in url:  # scp-style git@host:owner/repo.git
-        return url.split("@", 1)[1].split(":")[0] or None
-    return None
+    """Parse supported remote URLs; return None only for a local repo path.
 
-
-def _require_secondary_in_scope(sc, url, what):
-    """Scope-check a SECONDARY destination the primary --base check never saw: a --repo to
-    clone, an --upstream to fetch. "The base target is authorized" must not become a way to
-    reach an arbitrary (or hostile) host. A local path has no host to check. Returns True if
-    allowed; on a violation, prints + logs and returns False (the caller returns EXIT_SCOPE).
+    Standard URL parsing is essential: splitting before `@` or `/` can mistake a query
+    parameter for the authority. Only HTTP(S) clone URLs and Git's `git@host:path` form are
+    accepted as remote destinations; unsupported/malformed URL schemes fail closed.
     """
-    host = _url_host(url)
-    if not host:
-        return True
+    if not isinstance(url, str):
+        raise ValueError("destination is not text")
+    raw = url.strip()
+    if not raw or any(ord(ch) < 32 or ch == chr(92) for ch in raw):
+        raise ValueError("empty destination or disallowed control/backslash character")
+
+    if raw.startswith("git@"):
+        m = re.fullmatch(r"git@(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):(?P<path>.+)", raw)
+        if not m:
+            raise ValueError("malformed scp-style Git URL")
+        return canonical_host(m.group("host"))
+
+    if "://" not in raw:
+        if re.match(r"^(?:https?|ssh|git|file):", raw, re.I):
+            raise ValueError("remote URL must use a supported absolute HTTP(S) URL")
+        if "@" in raw and not raw.startswith(("/", "./", "../")) \
+                and not os.path.exists(raw):
+            raise ValueError("unsupported scp-style or userinfo destination")
+        return None
+
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise ValueError("only HTTP(S) remote URLs are supported")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("userinfo credentials are not allowed in remote URLs")
+        host = parsed.hostname
+        parsed.port  # validate malformed and out-of-range ports
+    except ValueError as e:
+        raise ValueError(f"invalid remote URL: {e}") from e
+    if not parsed.netloc or not host:
+        raise ValueError("remote URL has no hostname")
+    return canonical_host(host)
+
+
+def _require_secondary_in_scope(sc, url, what, allow_local=False):
+    """Scope-check a secondary destination before it can cause network/file activity.
+
+    `--repo` may be a local path; `--upstream` must be an absolute in-scope HTTP(S) URL.
+    Invalid URLs are not silently treated as local paths. Scope checks are policy checks,
+    not a network sandbox (DNS changes and remote redirects still need separate controls).
+    """
+    try:
+        host = _url_host(url)
+    except ValueError as e:
+        reason = f"invalid {what} destination: {e}"
+        print(f"SCOPE BLOCKED: {reason}", file=sys.stderr)
+        sc.log_scope_checks([], [{"host": "[invalid destination]", "reason": reason}])
+        return False
+    if host is None:
+        if allow_local and isinstance(url, str) and url.strip():
+            return True
+        reason = f"{what} must be an absolute HTTP(S) URL in scope"
+        print(f"SCOPE BLOCKED: {reason}", file=sys.stderr)
+        sc.log_scope_checks([], [{"host": "[missing destination host]", "reason": reason}])
+        return False
     try:
         sc.assert_in_scope(host)
-        return True
     except ScopeViolation as e:
         print(f"SCOPE BLOCKED: {what} reaches {host}, which is not in scope -> {e}",
               file=sys.stderr)
         sc.log_scope_checks([], [{"host": host, "reason": str(e)}])
         return False
+    if "://" in url and ("?" in url or "#" in url):
+        reason = f"{what} URL must not include a query or fragment"
+        print(f"SCOPE BLOCKED: {host} -> {reason}", file=sys.stderr)
+        sc.log_scope_checks([], [{"host": host, "reason": reason}])
+        return False
+    return True
 
 
 # Probe classes that change server state rather than only reading it. Running one against
@@ -548,26 +611,76 @@ def _require_destructive_ok(args, sc, probe_class):
     sys.exit(EXIT_SCOPE)
 
 
-def _client(args, sc=None):
-    """Build an HTTP client with the rate ceiling enforced.
+def _requested_rate(args):
+    """Return --rate or None; reject negative, zero-explicit, NaN and infinity."""
+    value = getattr(args, "rate", None)
+    if value in (None, 0):  # 0 is the parser's legacy 'not specified' default
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        print("ERROR: --rate must be a positive finite number", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
+    if not math.isfinite(rate) or rate <= 0:
+        print("ERROR: --rate must be a positive finite number", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
+    return rate
 
-    The ceiling comes from scope.yaml and is a MAXIMUM: --rate can lower it but never
-    raise it. Previously --rate defaulted to 0, meaning unlimited, and the scope ceiling
-    was written into the file and then never read.
+
+def _scope_rate_ceiling(sc):
+    """Read the engagement ceiling; malformed values must not disable the guard."""
+    raw = sc.data.get("rate_ceiling_rps")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        ceiling = float(raw)
+    except (TypeError, ValueError):
+        ceiling = 0
+    if not math.isfinite(ceiling) or ceiling <= 0:
+        print("SCOPE BLOCKED: rate_ceiling_rps must be a positive finite number",
+              file=sys.stderr)
+        sys.exit(EXIT_SCOPE)
+    return ceiling
+
+
+def _effective_rate(sc, requested, default=None):
+    """Apply the scope maximum to a positive requested/default rate."""
+    ceiling = _scope_rate_ceiling(sc)
+    rate = requested if requested is not None else default
+    if rate is not None:
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            print("ERROR: requested rate must be a positive finite number", file=sys.stderr)
+            sys.exit(EXIT_USAGE)
+        if not math.isfinite(rate) or rate <= 0:
+            print("ERROR: requested rate must be a positive finite number", file=sys.stderr)
+            sys.exit(EXIT_USAGE)
+    if ceiling is not None and rate is not None:
+        return min(ceiling, rate)
+    return ceiling if ceiling is not None else rate
+
+
+def positive_int(value):
+    """argparse type for explicit request-rate values; defaults remain unchanged."""
+    try:
+        rate = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if rate <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return rate
+
+
+def _client(args, sc=None):
+    """Build an HTTP client with the engagement's rate ceiling enforced.
+
+    The ceiling is a maximum: --rate can lower it, never raise it. A negative value used to
+    turn the inter-request interval negative and silently disable throttling.
     """
-    ceiling = None
     if sc is None:
         sc = require_scope(args)
-    raw = sc.data.get("rate_ceiling_rps")
-    try:
-        ceiling = float(raw) if raw else None
-    except (TypeError, ValueError):
-        ceiling = None
-    requested = getattr(args, "rate", 0) or None
-    if ceiling and requested:
-        rps = min(ceiling, requested)
-    else:
-        rps = ceiling or requested or 5      # default ceiling if nothing is configured
+    rps = _effective_rate(sc, _requested_rate(args), default=5)
     return probes.Http(args.base, rps=rps, timeout=args.timeout), rps
 
 def _record(args, verdict):
@@ -710,7 +823,7 @@ def cmd_probe(args):
             return EXIT_USAGE
         # `git clone` reaches whatever host --repo names. Scope-check it, or "the base is
         # authorized" becomes a way to clone an arbitrary — possibly malicious — repo.
-        if not _require_secondary_in_scope(sc, args.repo, "--repo"):
+        if not _require_secondary_in_scope(sc, args.repo, "--repo", allow_local=True):
             return EXIT_SCOPE
         run(probes.probe_git_history_leak(args.repo))
     # --- business logic: each needs a way to observe the resulting state ---
@@ -1117,38 +1230,51 @@ def _save_recon(engagement, what, host, payload):
 
 
 def _parse_host_port(target):
-    """Split an optional :port off a target host. Returns (host, port_or_None).
+    """Parse host[:port], bracketed IPv6, or an HTTP(S) URL for recon.
 
-    recon's help advertises host[:port], but the socket layer needs a bare hostname —
-    "1.2.3.4:5001" used as a hostname fails name resolution (verified). Only a single
-    trailing :digits is treated as a port; an IPv6 literal (two or more colons) is left
-    intact rather than split at the wrong colon.
+    Unbracketed IPv6 is treated as a complete address (a port on IPv6 must be bracketed).
+    URL parsing is shared with scope enforcement so the host checked is the host reached.
     """
-    if target.count(":") == 1:
-        h, _, p = target.partition(":")
-        if p.isdigit() and h:
-            return h, int(p)
-    return target, None
+    raw = str(target).strip()
+    if not raw:
+        raise ValueError("empty recon target")
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(raw)
+        host = canonical_host(raw)
+        port = parsed.port
+    else:
+        try:
+            host = canonical_host(raw)
+            # A complete IPv6 literal was handled before the host:port parser; no port.
+            try:
+                ipaddress.ip_address(raw)
+                return host, None
+            except ValueError:
+                pass
+            parsed = urllib.parse.urlsplit("//" + raw)
+            port = parsed.port
+        except ValueError as e:
+            raise ValueError(f"invalid recon target: {e}") from e
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return host, port
 
 
 def cmd_recon(args):
     """Ports / TLS / HTTP fingerprint. Scope-gated like every other network command."""
     sc, reason = _require_in_scope(args)
-    rps = args.rate or None
-    try:
-        raw = sc.data.get("rate_ceiling_rps")
-        ceiling = float(raw) if raw else None
-    except (TypeError, ValueError):
-        ceiling = None
-    if ceiling:
-        rps = min(ceiling, rps) if rps else ceiling
-    print(f"  scope: {reason} | rate ceiling {rps or 'unset'} req/s", file=sys.stderr)
+    rps = _effective_rate(sc, _requested_rate(args), default=5)
+    print(f"  scope: {reason} | rate ceiling {rps} req/s", file=sys.stderr)
 
     # The help advertises host[:port]. Split it once, here, so the socket layer gets a bare
     # hostname — passing "1.2.3.4:5001" as a hostname fails name resolution. An explicit
     # port becomes the port to scan / connect when the branch has no other source. (The
     # http branch builds a URL from args.target, where host:port is already correct.)
-    host, explicit_port = _parse_host_port(args.target)
+    try:
+        host, explicit_port = _parse_host_port(args.target)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return EXIT_USAGE
     statemod.log_action(args.engagement, "recon", f"recon {args.what} {host}", host,
                         "started")
     if args.what == "ports":
@@ -1190,6 +1316,50 @@ def cmd_recon(args):
         sys.exit(EXIT_NORESULT if not ((wrapped.get("ports") or {}).get("open")) else 0)
 
 
+def _mask_walk(value):
+    """Recursively remove credential-bearing fields before any chain output is rendered.
+
+    Walk results are intentionally rich enough for the local probe layer, but the CLI is an
+    output boundary. Some HTTP libraries put body snippets inside `steps[].detail`; a shallow
+    mask of only the top-level `token` field still leaks those values to text and JSON.
+    """
+    sensitive_parts = ("token", "cookie", "credential", "password", "passwd", "secret",
+                       "authorization", "session")
+    safe_name_fields = {"token_kind", "token_type", "secret_name", "credential_name"}
+    secrets = []
+
+    def collect(obj, key=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                collect(v, str(k))
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                collect(v, key)
+        elif (isinstance(obj, str) and obj and key.lower() not in safe_name_fields
+              and any(part in key.lower() for part in sensitive_parts)):
+            secrets.append(obj)
+
+    collect(value)
+    secrets = sorted(set(s for s in secrets if len(s) >= 4), key=len, reverse=True)
+
+    def clean(obj, key=""):
+        if isinstance(obj, dict):
+            return {k: clean(v, str(k)) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [clean(v, key) for v in obj]
+        if isinstance(obj, str):
+            if obj and key.lower() not in safe_name_fields \
+                    and any(part in key.lower() for part in sensitive_parts):
+                return probes._mask_secret(obj)
+            for secret in secrets:
+                if secret in obj:
+                    obj = obj.replace(secret, probes._mask_secret(secret))
+            return obj
+        return obj
+
+    return clean(value)
+
+
 def cmd_chain(args):
     fs = fnd.all_findings(args.engagement)
     ch, de = chains.analyse(fs)
@@ -1218,10 +1388,11 @@ def cmd_chain(args):
             r3 = chainwalk.walk_alg_none_to_admin(h, f, args.walk_admin_endpoint)
             r3["name"] = (f"{f['id']} unsigned alg:none token -> admin identity accepted")
             walked.append(r3)
+    safe_walked = [_mask_walk(w) for w in walked]
     body = chains.render(ch, de)
-    if walked:
-        body += "\n\n" + chainwalk.render(walked)
-        for w in walked:
+    if safe_walked:
+        body += "\n\n" + chainwalk.render(safe_walked)
+        for w in safe_walked:
             if chainwalk.escalation_withdrawn(w):
                 body += (f"\n> **{w['name']}: escalation WITHDRAWN.** The chain was "
                          f"attempted and broke. Revert this finding to its standalone "
@@ -1235,19 +1406,10 @@ def cmd_chain(args):
         c = sum(1 for w in walked if w["verdict"] == "CANNOT_ATTEMPT")
         lines.append(f"walked: {d} demonstrated, {n} broke (escalation withdrawn), "
                      f"{c} could not be attempted")
-    # The walked results carry the forged token / session values that proved the chain.
-    # Those are live credentials; the human-readable render above already describes the
-    # demonstration without them, so mask them before they reach --json or a saved report.
-    def _mask_walk(w):
-        out = dict(w)
-        for k in list(out):
-            if isinstance(out[k], str) and any(
-                    t in k.lower() for t in ("token", "cookie", "credential", "password", "secret")):
-                out[k] = probes._mask_secret(out[k])
-        return out
+    # Both the rendered text and JSON payload use the recursively sanitized results.
     emit(args, lines, {"chains": ch, "de_escalations": de,
                        "escalated": [x["entry"] for x in esc],
-                       "walked": [_mask_walk(w) for w in walked]})
+                       "walked": safe_walked})
 
 
 def cmd_reliability(args):
@@ -1537,7 +1699,7 @@ def build_parser():
     i.add_argument("--authorization", help="own asset / contract ref / bounty program ID")
     i.add_argument("--type", default="blackbox", choices=["blackbox", "greybox", "whitebox"])
     i.add_argument("--destructive", action="store_true")
-    i.add_argument("--rate", type=int, default=5, help="requests/sec ceiling")
+    i.add_argument("--rate", type=positive_int, default=5, help="requests/sec ceiling")
     i.add_argument("--force", action="store_true"); i.add_argument("--json", action="store_true")
     i.set_defaults(fn=cmd_scope_init)
     c = ss.add_parser("check", help="test hosts against scope WITHOUT touching them")
@@ -1553,7 +1715,7 @@ def build_parser():
     fp.add_argument("--base", required=True)
     fp.add_argument("--path", default="/", help="path to fetch (default /)")
     fp.add_argument("--cve", action="store_true", help="correlate detected versions with OSV.dev (live)")
-    fp.add_argument("--rate", type=int, default=0); fp.add_argument("--timeout", type=int, default=15)
+    fp.add_argument("--rate", type=positive_int, default=0); fp.add_argument("--timeout", type=int, default=15)
     fp.set_defaults(fn=cmd_fingerprint)
 
     va = sub.add_parser("variants", help="from one confirmed fault, sweep the same class across sibling endpoints")
@@ -1571,13 +1733,13 @@ def build_parser():
                     help="auto-crawl the target for endpoints+params instead of listing them")
     va.add_argument("--default-param", default="id",
                     help="param to sweep on endpoints that advertise none (default id)")
-    va.add_argument("--rate", type=int, default=0); va.add_argument("--timeout", type=int, default=15)
+    va.add_argument("--rate", type=positive_int, default=0); va.add_argument("--timeout", type=int, default=15)
     va.set_defaults(fn=cmd_variants)
 
     rt = sub.add_parser("retest", help="re-run confirmed findings after a fix; reports not-reproduced / still-open")
     rt.add_argument("--base", required=True)
     rt.add_argument("--finding", metavar="PTX-ID", help="retest one finding (default: all confirmed)")
-    rt.add_argument("--rate", type=int, default=0); rt.add_argument("--timeout", type=int, default=15)
+    rt.add_argument("--rate", type=positive_int, default=0); rt.add_argument("--timeout", type=int, default=15)
     rt.set_defaults(fn=cmd_retest)
 
     rd = sub.add_parser("redact", help="replace subject identifiers with stable placeholders before text crosses the LLM boundary")
@@ -1597,7 +1759,7 @@ def build_parser():
     lf.add_argument("--json", action="store_true"); lf.set_defaults(fn=cmd_cve_lockfile)
     rc = cvs.add_parser("reachability", help="is the vulnerable code actually reachable?")
     rc.add_argument("path"); rc.add_argument("--base", help="live target to check against")
-    rc.add_argument("--rate", type=int, default=2); rc.add_argument("--timeout", type=int, default=30)
+    rc.add_argument("--rate", type=positive_int, default=2); rc.add_argument("--timeout", type=int, default=30)
     rc.add_argument("--json", action="store_true"); rc.set_defaults(fn=cmd_cve_reach)
     q = cvs.add_parser("query", help="query one package version")
     q.add_argument("package"); q.add_argument("version")
@@ -1616,8 +1778,10 @@ def build_parser():
     tk.add_argument("domain")
     tk.add_argument("--hosts", help="comma-separated hosts to assess instead of enumerating")
     tk.add_argument("--timeout", type=int, default=12)
-    tk.add_argument("--rate", type=int, default=5,
+    tk.add_argument("--rate", type=positive_int, default=5,
                     help="confirmation requests per second to third-party services")
+    tk.add_argument("--confirm-third-party", action="store_true",
+                    help="send an HTTP confirmation GET to the hosting service; require explicit RoE permission")
     tk.add_argument("--json", action="store_true")
     tk.set_defaults(fn=cmd_osint_takeover)
     wb = os_.add_parser("wayback"); wb.add_argument("domain")
@@ -1680,7 +1844,7 @@ def build_parser():
     pr.add_argument("--user-field", default="username", dest="user_field",
                     help="name of the username field in the login body (default: username)")
     pr.add_argument("--data", default="{}"); pr.add_argument("--n", type=int, default=10)
-    pr.add_argument("--rate", type=int, default=0,
+    pr.add_argument("--rate", type=positive_int, default=0,
                     help="lower the rate ceiling from scope.yaml (never raises it)")
     pr.add_argument("--timeout", type=int, default=15); pr.add_argument("--json", action="store_true")
     pr.set_defaults(fn=cmd_probe)
@@ -1701,7 +1865,7 @@ def build_parser():
                     help="body field used to recognise the record we created")
     ma.add_argument("--verify-path"); ma.add_argument("--verify-key", default="users")
     ma.add_argument("--verify-match-key", default="username"); ma.add_argument("--verify-match-value")
-    ma.add_argument("--rate", type=int, default=0); ma.add_argument("--timeout", type=int, default=15)
+    ma.add_argument("--rate", type=positive_int, default=0); ma.add_argument("--timeout", type=int, default=15)
     ma.add_argument("--json", action="store_true"); ma.set_defaults(fn=cmd_probe_mass_assignment)
 
     lg = sub.add_parser("logic", help="solve for a business-logic invariant violation (needs z3)")
@@ -1716,7 +1880,7 @@ def build_parser():
                          "outcome, e.g. \"total < 0\"")
     lg.add_argument("--baseline", help="JSON legitimate request used as a control")
     lg.add_argument("--method", default="POST")
-    lg.add_argument("--rate", type=int, default=0); lg.add_argument("--timeout", type=int, default=15)
+    lg.add_argument("--rate", type=positive_int, default=0); lg.add_argument("--timeout", type=int, default=15)
     lg.add_argument("--json", action="store_true"); lg.set_defaults(fn=cmd_logic)
 
     rc = sub.add_parser("race-consume", help="fire concurrent requests at a single-use action; judge by the state delta")
@@ -1728,7 +1892,7 @@ def build_parser():
     rc.add_argument("--body", help="JSON body for the action")
     rc.add_argument("--method", default="POST")
     rc.add_argument("--requests", type=int, default=8, help="concurrent requests to fire (default 8)")
-    rc.add_argument("--rate", type=int, default=0); rc.add_argument("--timeout", type=int, default=15)
+    rc.add_argument("--rate", type=positive_int, default=0); rc.add_argument("--timeout", type=int, default=15)
     rc.add_argument("--json", action="store_true"); rc.set_defaults(fn=cmd_race_consume)
 
     ds = sub.add_parser("double-spend", help="replay a one-time action to test for double-spend / coupon reuse")
@@ -1738,13 +1902,13 @@ def build_parser():
     ds.add_argument("--state-field", required=True, help="numeric field in the state JSON to watch (e.g. balance)")
     ds.add_argument("--body", help="JSON body for the action")
     ds.add_argument("--method", default="POST")
-    ds.add_argument("--rate", type=int, default=0); ds.add_argument("--timeout", type=int, default=15)
+    ds.add_argument("--rate", type=positive_int, default=0); ds.add_argument("--timeout", type=int, default=15)
     ds.add_argument("--json", action="store_true"); ds.set_defaults(fn=cmd_double_spend)
 
     cl = sub.add_parser("probe-credential-leak", help="find a usable credential embedded in a response")
     cl.add_argument("--base", required=True); cl.add_argument("--endpoint", required=True)
     cl.add_argument("--method", default="GET")
-    cl.add_argument("--rate", type=int, default=0); cl.add_argument("--timeout", type=int, default=15)
+    cl.add_argument("--rate", type=positive_int, default=0); cl.add_argument("--timeout", type=int, default=15)
     cl.add_argument("--json", action="store_true"); cl.set_defaults(fn=cmd_probe_credential_leak)
 
     ss = sub.add_parser("session", help="named identities, so a probe can act as a "
@@ -1757,7 +1921,7 @@ def build_parser():
     sl.add_argument("--user-field", default="username"); sl.add_argument("--pass-field", default="password")
     sl.add_argument("--role", default="", help="what this identity is for, e.g. 'admin'")
     sl.add_argument("--note", default="")
-    sl.add_argument("--rate", type=int, default=0); sl.add_argument("--timeout", type=int, default=15)
+    sl.add_argument("--rate", type=positive_int, default=0); sl.add_argument("--timeout", type=int, default=15)
     sl.add_argument("--json", action="store_true"); sl.set_defaults(fn=cmd_session)
     sli = sss.add_parser("list"); sli.add_argument("--json", action="store_true")
     sli.set_defaults(fn=cmd_session)
@@ -1775,7 +1939,7 @@ def build_parser():
     dc.add_argument("--depth", type=int, default=2, help="crawl depth from each start path")
     dc.add_argument("--methods", action="store_true",
                     help="ask OPTIONS/POST/PUT/DELETE on each discovered path")
-    dc.add_argument("--rate", type=int, default=0); dc.add_argument("--timeout", type=int, default=15)
+    dc.add_argument("--rate", type=positive_int, default=0); dc.add_argument("--timeout", type=int, default=15)
     dc.add_argument("--json", action="store_true"); dc.set_defaults(fn=cmd_discover)
 
     fi = sub.add_parser("finding", help="findings — validated records, not free text")
@@ -1808,7 +1972,7 @@ def build_parser():
         sp.add_argument("--ports", help="e.g. '80,443,8000-8010' (ports/run only)")
         sp.add_argument("--port", type=int, default=443, help="TLS port (tls only)")
         sp.add_argument("--timeout", type=float, default=1.5)
-        sp.add_argument("--rate", type=int, default=0,
+        sp.add_argument("--rate", type=positive_int, default=0,
                         help="lower the rate ceiling from scope.yaml (never raises it)")
         sp.add_argument("--json", action="store_true")
         sp.set_defaults(fn=cmd_recon, what=nm)
@@ -1823,7 +1987,7 @@ def build_parser():
     cn.add_argument("--walk-login", help="login path for the credentials chain")
     cn.add_argument("--walk-admin-endpoint", default="/api/admin/users",
                     help="an endpoint that should require admin, for the alg:none walk")
-    cn.add_argument("--rate", type=int, default=0)
+    cn.add_argument("--rate", type=positive_int, default=0)
     cn.add_argument("--timeout", type=int, default=15)
     cn.add_argument("--json", action="store_true"); cn.set_defaults(fn=cmd_chain)
 

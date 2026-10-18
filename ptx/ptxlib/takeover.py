@@ -21,6 +21,7 @@ The distinction between the first two is the same one that cost this codebase a 
 "could not confirm" is not "not vulnerable", and reporting it as clean is how a real
 takeover disappears from a report.
 """
+import math
 import re
 import subprocess
 import threading
@@ -196,6 +197,13 @@ class _Throttle:
     """
 
     def __init__(self, rps=None):
+        if rps is not None:
+            try:
+                rps = float(rps)
+            except (TypeError, ValueError) as e:
+                raise ValueError("rps must be a non-negative finite number") from e
+            if not math.isfinite(rps) or rps < 0:
+                raise ValueError("rps must be a non-negative finite number")
         self.min_interval = (1.0 / rps) if rps else 0
         self._last = 0.0
         self._lock = threading.Lock()
@@ -210,13 +218,25 @@ class _Throttle:
             self._last = time.time()
 
 
-def _fetch(host, timeout):
-    """GET the host over HTTPS then HTTP, returning (status, body). Never raises."""
-    for scheme in ("https", "http"):
+def _fetch(host, timeout, wait=None):
+    """GET the scoped host over HTTPS then HTTP, returning (status, body). Never raises.
+
+    Do not follow redirects: an in-scope hostname must not redirect this confirmation probe
+    to a different, unchecked host. If HTTPS cannot connect, space the HTTP fallback as a
+    second request too; the engagement limit is per request, not per hostname.
+    """
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    for attempt, scheme in enumerate(("https", "http")):
+        if attempt and wait is not None:
+            wait()
         url = f"{scheme}://{host}/"
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with opener.open(req, timeout=timeout) as r:
                 return r.status, r.read(20000).decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             try:
@@ -229,8 +249,13 @@ def _fetch(host, timeout):
     return None, None
 
 
-def check_host(host, timeout=8, runner=None, fetch=None):
-    """Assess one host. Returns a dict, or None when it is not a takeover candidate."""
+def check_host(host, timeout=8, runner=None, fetch=None, confirm_third_party=False,
+               rate_wait=None):
+    """Assess one host. Returns a dict, or None when it is not a takeover candidate.
+
+    The real HTTP confirmation contacts the hosting service behind the target's CNAME. It is
+    opt-in for live use; injecting `fetch` is an explicit test/offline harness override.
+    """
     chain = cname_chain(host, timeout=timeout, runner=runner)
     if chain is None:
         return {"host": host, "verdict": "UNMEASURED",
@@ -243,10 +268,17 @@ def check_host(host, timeout=8, runner=None, fetch=None):
 
     base = {"host": host, "service": svc["service"], "cname": chain,
             "claim_hint": svc["claim"]}
+    if fetch is None and not confirm_third_party:
+        base.update(
+            verdict="CANDIDATE",
+            reason="DNS points at a claimable service, but no HTTP request was sent to the "
+                   "third-party host. Re-run with --confirm-third-party only if the rules "
+                   "of engagement explicitly permit that confirmation.")
+        return base
     if fetch is not None:
         status, body = fetch(host, timeout)
     else:
-        status, body = _fetch(host, timeout)
+        status, body = _fetch(host, timeout, wait=rate_wait)
 
     if status is None:
         base.update(verdict="CANDIDATE",
@@ -269,14 +301,22 @@ def check_host(host, timeout=8, runner=None, fetch=None):
     return base
 
 
-def scan(hosts, timeout=8, runner=None, fetch=None, rps=None):
-    """Assess a list of hosts. Always returns a summary, never raises."""
+def scan(hosts, timeout=8, runner=None, fetch=None, rps=5,
+         confirm_third_party=False):
+    """Assess a list of hosts; per-host assessment failures become UNMEASURED results.
+
+    Live HTTP confirmation is disabled unless explicitly opted into. `fetch` remains
+    injectable for local tests and controlled harnesses. The default live rate is 5
+    requests/second; invalid negative or non-finite rates raise ValueError.
+    """
     throttle = _Throttle(rps)
     results, unmeasured = [], []
     for h in hosts:
         throttle.wait()
         try:
-            r = check_host(h, timeout=timeout, runner=runner, fetch=fetch)
+            r = check_host(h, timeout=timeout, runner=runner, fetch=fetch,
+                           confirm_third_party=confirm_third_party,
+                           rate_wait=throttle.wait)
         except Exception as e:                     # one bad host must not end the scan
             unmeasured.append({"host": h, "verdict": "UNMEASURED",
                                "reason": f"assessment failed: {e}"})

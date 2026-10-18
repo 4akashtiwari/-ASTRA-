@@ -6,7 +6,7 @@ On violation: raise ScopeViolation, log the attempt, exit 3.
 
 This is code, not a prompt instruction. A prompt can be talked out of a rule; this cannot.
 """
-import ipaddress, json, os, re, time
+import ipaddress, json, os, re, time, urllib.parse
 
 
 class ScopeViolation(Exception):
@@ -22,6 +22,89 @@ _PATTERN_OK = re.compile(
     r"(?:/[0-9]{1,2})?"                              # optional CIDR prefix
     r"(?::[0-9]{1,5})?$"                             # optional port
 )
+
+
+def canonical_host(value):
+    """Return the canonical hostname/IP a target string will actually address.
+
+    Accept a bare hostname, host:port, a bracketed IPv6 literal, or an HTTP(S) URL.
+    Parse URLs with the standard URL parser: splitting on `/` or `@` lets query text
+    masquerade as the hostname (for example, `http://evil.invalid?x=.in-scope.test`).
+    Invalid, ambiguous, or non-HTTP schemes fail closed by raising ValueError.
+    """
+    if not isinstance(value, str):
+        raise ValueError("target is not text")
+    raw = value.strip()
+    if not raw or any(ord(ch) < 32 or ch == chr(92) for ch in raw):
+        raise ValueError("empty target or disallowed control/backslash character")
+
+    if "://" in raw:
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            if parsed.scheme.lower() not in ("http", "https"):
+                raise ValueError("only HTTP(S) targets are supported")
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("userinfo credentials are not allowed in target URLs")
+            host = parsed.hostname
+            parsed.port  # force validation of a malformed or out-of-range port
+        except ValueError as e:
+            raise ValueError(f"invalid target URL: {e}") from e
+        if not parsed.netloc or not host:
+            raise ValueError("target URL has no hostname")
+    else:
+        # Bare IPv6 has several colons and is ambiguous to urlsplit; recognize a complete
+        # literal first. A port on IPv6 must use [address]:port.
+        try:
+            return ipaddress.ip_address(raw).compressed.lower()
+        except ValueError:
+            pass
+        if "@" in raw:
+            raise ValueError("userinfo is only valid inside an HTTP(S) URL")
+        try:
+            parsed = urllib.parse.urlsplit("//" + raw)
+            host = parsed.hostname
+            parsed.port  # validate host:port before accepting the hostname
+        except ValueError as e:
+            raise ValueError(f"invalid host or port: {e}") from e
+        if not host:
+            raise ValueError("target has no hostname")
+
+    host = (host[:-1] if host.endswith(".") else host).lower()
+    if not host:
+        raise ValueError("target has an empty hostname")
+    try:
+        return ipaddress.ip_address(host).compressed.lower()
+    except ValueError:
+        pass
+    if ":" in host:
+        raise ValueError("invalid IPv6 hostname")
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError as e:
+        raise ValueError("invalid internationalized hostname") from e
+    if (len(host) > 253 or not re.fullmatch(r"[a-z0-9_.-]+", host)
+            or host.startswith(".") or ".." in host):
+        raise ValueError("invalid hostname")
+    if re.fullmatch(r"[0-9.]+", host):
+        try:
+            return str(ipaddress.IPv4Address(host))
+        except ValueError as e:
+            raise ValueError("invalid IPv4 address") from e
+    return host
+
+
+def _valid_pattern(pattern):
+    """Validate ordinary host patterns plus IPv6 literals/networks."""
+    if _PATTERN_OK.fullmatch(pattern):
+        return True
+    try:
+        if "/" in pattern:
+            ipaddress.ip_network(pattern, strict=False)
+        else:
+            ipaddress.ip_address(pattern)
+        return True
+    except ValueError:
+        return False
 
 
 def strip_comment(value):
@@ -151,7 +234,7 @@ class Scope:
         """
         bad = [(n, p) for n, plist in (("in_scope", self.in_scope),
                                        ("exclusions", self.exclusions))
-               for p in plist if not _PATTERN_OK.match(p)]
+               for p in plist if not _valid_pattern(p)]
         if bad:
             listed = "\n".join(f"    {n}: {p!r}" for n, p in bad)
             raise ScopeViolation(
@@ -162,9 +245,15 @@ class Scope:
 
     # --- the guard -----------------------------------------------------------
     def is_in_scope(self, host):
-        """Returns (allowed: bool, reason: str)."""
-        h = host.lower().strip().strip(".")
-        h = re.sub(r"^https?://", "", h).split("/")[0].split(":")[0]
+        """Returns (allowed: bool, reason: str), using the URL's actual hostname.
+
+        Query, fragment, userinfo, port and IPv6 syntax are parsed before matching. Treating
+        a raw URL as a string let `?x=.in-scope.example` masquerade as an authorized suffix.
+        """
+        try:
+            h = canonical_host(host)
+        except (TypeError, ValueError) as e:
+            return False, f"invalid host: {e}"
         if not h:
             return False, "empty host"
 
