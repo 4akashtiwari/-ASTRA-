@@ -28,3 +28,6 @@ venv/
 .DS_Store
 *.swp
 .sudo_as_admin_successful
+
+# web console runtime state (regenerated on startup)
+web/demo-engagement/

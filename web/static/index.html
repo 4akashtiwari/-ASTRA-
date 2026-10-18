@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASTRA — web pentest console</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">▲</span> ASTRA <span class="sub">web pentest console</span></div>
+  <div class="status">
+    <span class="pill" id="base">base …</span>
+    <span class="pill" id="bench">bench …</span>
+    <span class="pill" id="scope">scope …</span>
+    <span class="pill" id="fcount">0 findings</span>
+  </div>
+</header>
+
+<main>
+  <aside class="rail">
+    <section class="card">
+      <h2>Probe</h2>
+      <label>class
+        <select id="p-class"></select>
+      </label>
+      <label>path <input id="p-path" value="/search" spellcheck="false"></label>
+      <label>param <input id="p-param" value="q" spellcheck="false"></label>
+      <button class="go" id="run-probe">Run probe ▸</button>
+      <p class="hint">The CLI's scope guard decides what may be touched — not this form.</p>
+    </section>
+
+    <section class="card">
+      <h2>Variant sweep</h2>
+      <label>class
+        <select id="v-class"></select>
+      </label>
+      <label>or from finding <input id="v-finding" placeholder="PTX-001" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" id="v-discover" checked> auto-discover endpoints</label>
+      <button class="go" id="run-variants">Sweep siblings ▸</button>
+      <p class="hint">From one confirmed fault, find every endpoint that shares it.</p>
+    </section>
+
+    <section class="card">
+      <h2>Verify &amp; recon</h2>
+      <div class="row">
+        <button id="run-retest">Retest findings</button>
+        <button id="run-fingerprint">Fingerprint + CVE</button>
+      </div>
+      <div class="row">
+        <button id="run-discover">Map surface</button>
+        <button id="run-coverage">Coverage</button>
+      </div>
+    </section>
+  </aside>
+
+  <section class="console-wrap">
+    <div class="console-bar">
+      <span>console</span>
+      <button id="clear" class="mini">clear</button>
+    </div>
+    <pre id="console" class="console"><span class="dim">ASTRA console ready. Pick an action on the left.
+Every command runs through the ptx CLI, so the scope guard, rate ceiling and evidence
+discipline apply exactly as they do on the command line.</span></pre>
+  </section>
+
+  <aside class="findings-wrap">
+    <div class="console-bar"><span>findings</span><button id="refresh" class="mini">↻</button></div>
+    <div id="findings" class="findings"><p class="dim">none yet</p></div>
+  </aside>
+</main>
+
+<footer>
+  ASTRA · target is a local owned sandbox benchmark · this console will not scan a host the
+  engagement scope does not authorise.
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
