@@ -246,6 +246,17 @@ def cmd_osint_takeover(args):
 
     if args.hosts:
         hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+        # --hosts is caller-supplied and every host is fetched. They must be subdomains of
+        # the authorized domain, or --hosts becomes a way to point the takeover scan at
+        # arbitrary third parties the engagement never covered.
+        dom = (args.domain or "").lower().lstrip(".")
+        off = [h for h in hosts if not (h.lower() == dom or h.lower().endswith("." + dom))]
+        if off:
+            print(f"SCOPE BLOCKED: --hosts not under {args.domain}: {', '.join(off)}",
+                  file=sys.stderr)
+            sc.log_scope_checks([], [{"host": h, "reason": f"not under {args.domain}"}
+                                     for h in off])
+            return EXIT_SCOPE
         source = f"{len(hosts)} host(s) supplied with --hosts"
     else:
         subs = osint.subdomains(args.domain, timeout=args.timeout)
@@ -449,6 +460,34 @@ def _require_in_scope(args):
         sc.log_scope_checks([], [{"host": host, "reason": str(e)}])
         sys.exit(EXIT_SCOPE)
     return sc, reason
+
+
+def _url_host(url):
+    """The host a URL (or scp-style git target) will reach, or None for a local path."""
+    if "://" in url:
+        return url.split("://", 1)[1].split("/")[0].split("@")[-1].split(":")[0] or None
+    if "@" in url and ":" in url:  # scp-style git@host:owner/repo.git
+        return url.split("@", 1)[1].split(":")[0] or None
+    return None
+
+
+def _require_secondary_in_scope(sc, url, what):
+    """Scope-check a SECONDARY destination the primary --base check never saw: a --repo to
+    clone, an --upstream to fetch. "The base target is authorized" must not become a way to
+    reach an arbitrary (or hostile) host. A local path has no host to check. Returns True if
+    allowed; on a violation, prints + logs and returns False (the caller returns EXIT_SCOPE).
+    """
+    host = _url_host(url)
+    if not host:
+        return True
+    try:
+        sc.assert_in_scope(host)
+        return True
+    except ScopeViolation as e:
+        print(f"SCOPE BLOCKED: {what} reaches {host}, which is not in scope -> {e}",
+              file=sys.stderr)
+        sc.log_scope_checks([], [{"host": host, "reason": str(e)}])
+        return False
 
 
 # Probe classes that change server state rather than only reading it. Running one against
@@ -658,6 +697,10 @@ def cmd_probe(args):
     if which == "race":
         run(probes.probe_race(h, args.path, json.loads(args.data), args.cookie, n=args.n))
     if which == "confused-deputy":
+        # The upstream is a second network destination the probe fetches directly; the
+        # --base check does not cover it.
+        if not _require_secondary_in_scope(sc, args.upstream, "--upstream"):
+            return EXIT_SCOPE
         run(probes.probe_confused_deputy(
             h, args.path, param=args.param, upstream=args.upstream,
             auth_path=args.auth_path, private_path=args.private_path))
@@ -665,6 +708,10 @@ def cmd_probe(args):
         if not args.repo:
             print("  git-history-leak needs --repo <url-or-path>")
             return EXIT_USAGE
+        # `git clone` reaches whatever host --repo names. Scope-check it, or "the base is
+        # authorized" becomes a way to clone an arbitrary — possibly malicious — repo.
+        if not _require_secondary_in_scope(sc, args.repo, "--repo"):
+            return EXIT_SCOPE
         run(probes.probe_git_history_leak(args.repo))
     # --- business logic: each needs a way to observe the resulting state ---
     def _balance(hh, hdr):

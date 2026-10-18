@@ -6565,3 +6565,29 @@ class TestReviewFixes(unittest.TestCase):
         mode = stat.S_IMODE(os.stat(p).st_mode)
         self.assertEqual(mode, 0o600, f"redaction map is {oct(mode)}, must be 0600")
         self.assertFalse(os.path.exists(p + ".tmp"), "atomic write left a temp file behind")
+
+    def test_url_host_extracts_the_destination(self):
+        import ptx as ptxmod
+        self.assertEqual(ptxmod._url_host("https://github.com/o/r.git"), "github.com")
+        self.assertEqual(ptxmod._url_host("https://user@host.com:8443/x"), "host.com")
+        self.assertEqual(ptxmod._url_host("git@github.com:o/r.git"), "github.com")
+        self.assertIsNone(ptxmod._url_host("/local/path/repo"))  # a local path has no host
+
+    def test_secondary_destination_outside_scope_is_blocked(self):
+        # git-history-leak clones --repo, a destination the --base check never saw. An
+        # out-of-scope repo host must be refused, not cloned, so "the base is authorized"
+        # cannot become a way to reach an arbitrary host.
+        PTX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "ptx", "ptx.py")
+        d = tempfile.mkdtemp(prefix="ptxscope2")
+        self.addCleanup(shutil.rmtree, d, True)
+        subprocess.run([sys.executable, PTX, "--engagement", d, "scope", "init", "127.0.0.1",
+                        "--in-scope", "127.0.0.1", "--authorization", "test", "--rate", "30"],
+                       capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            [sys.executable, PTX, "--engagement", d, "probe", "git-history-leak",
+             "--base", "http://127.0.0.1:5999", "--repo", "https://evil.example.com/x.git"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 3)  # EXIT_SCOPE
+        self.assertIn("SCOPE BLOCKED", r.stderr)
+        self.assertIn("evil.example.com", r.stderr)
